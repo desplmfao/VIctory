@@ -8,6 +8,45 @@ the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
 
+## This fork: the PRs we run (Linux, NVIDIA)
+
+This fork's `main` is upstream `main` plus a stack of open pull requests that we
+test together on Linux (CachyOS, proton-cachyos 11.0, vkd3d-proton, RTX 5080).
+Upstream only takes pull requests from collaborators now, so this branch keeps
+track of what we use. Clone it and build as described below.
+
+Upstream base: Marvisak/VIctory `main` at `ffe310e`.
+
+| PR | Author | What it does |
+|----|--------|--------------|
+| [#185](https://github.com/Marvisak/VIctory/pull/185) via [aycow/VIctory#4](https://github.com/aycow/VIctory/pull/4) | aycow (merge with main: desplmfao) | Shadow-buffer coherency for directly indexed SRVs; includes [aycow/VIctory#2](https://github.com/aycow/VIctory/pull/2) (shared write-watch questions) |
+| [#493](https://github.com/Marvisak/VIctory/pull/493) | hophaver | Root SRVs as one-view tables; fixes the hang at world entry |
+| [#259](https://github.com/Marvisak/VIctory/pull/259) | desplmfao | Query a descriptor's level count only when word 3 is read (NVIDIA pipeline crash) |
+| [#178](https://github.com/Marvisak/VIctory/pull/178) | Ortomanic | Compile the indirect-argument clamp with DXC when D3DCompile refuses it (Wine/Proton) |
+| [#151](https://github.com/Marvisak/VIctory/pull/151) | ItsYusei99 | 16 MiB default thread stack |
+| [#542](https://github.com/Marvisak/VIctory/pull/542) | gingertonik | Keep buffer offsets below 2 GiB (NVIDIA device loss in the world) |
+| [#180](https://github.com/Marvisak/VIctory/pull/180) | permadiego | Twin descriptor loads and quad gradients for compute samples (+300 compute shaders) |
+| [#539](https://github.com/Marvisak/VIctory/pull/539) | SAitken91 | 64-bit image atomics (+522 vertex/pixel shaders) |
+| [#551](https://github.com/Marvisak/VIctory/pull/551) | kilvynsilveira-tech | Compute group info, wave id in workgroup, sample coverage |
+| [#489](https://github.com/Marvisak/VIctory/pull/489) | Brazlucas | Spill-table loads read the arguments as they were on entry |
+| [#177](https://github.com/Marvisak/VIctory/pull/177) (commit `e55eb69` only) | Ortomanic | Key heap handles by element type; without it NVIDIA crashes creating several compute pipelines |
+| [#491](https://github.com/Marvisak/VIctory/pull/491) | desplmfao | `VICTORY_PIPELINE_JOURNAL`: skip pipelines whose creation crashed an earlier run |
+| [#638](https://github.com/Marvisak/VIctory/pull/638) | claude-GTA6 | Diagnostics: render-target capture and display (`VICTORY_CAPTURE*`, `VICTORY_SHOW_TARGET`) |
+
+Local addition, for testing only: `VICTORY_CAPPED_DYNAMIC=16..19` sets how many
+dynamic descriptor slots the capped NVIDIA view heap keeps (default 16, that is
+2^16). 18 removes the "no dynamic slots" draw drops; see issue
+[#747](https://github.com/Marvisak/VIctory/issues/747).
+
+Running under Proton is much faster with the wineserver patch from
+[#340](https://github.com/Marvisak/VIctory/issues/340) (about 4 s to 1 s per
+world frame here).
+
+State of this stack (2026-11-24): boots and reaches the world at about
+1.5 fps and 4,000 draws per frame. The picture is mostly white, which earlier
+stacks without #180/#539 did not show; this is being investigated. The game
+process uses about 24 GB of memory in the world.
+
 ## Status (2026-11-23)
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps and
