@@ -988,7 +988,16 @@ impl<'a> Lower<'a> {
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
-            Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            Input::GroupInfo => {
+                // Bits 0-5 hold the wave count, bits 6-11 the wave index.
+                let wave = self.wave();
+                let threads: u32 = self.s.threads.expect("compute").iter().product();
+                let count = self.s.m.i32(threads.div_ceil(wave));
+                let w = self.wave_id();
+                let k6 = self.s.m.i32(6);
+                let w = self.s.m.bin(self.s.entry, Bin::Shl, w, k6);
+                return Val::I32(self.s.m.bin(self.s.entry, Bin::Or, w, count));
+            }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
@@ -999,11 +1008,19 @@ impl<'a> Lower<'a> {
             Input::MergedWaveInfo => {
                 // shortcut: only the wave index (bits 24-27) is set; the
                 // console's other bits (lane counts) are read by no program.
-                let f = self.mesh_thread();
-                let shift = self.s.m.i32(self.wave().trailing_zeros());
-                let w = self.s.m.bin(self.s.entry, Bin::LShr, f, shift);
+                let w = self.wave_id();
                 let k24 = self.s.m.i32(24);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Shl, w, k24));
+            }
+            Input::SampleCoverage => {
+                return Val::I32(self.s.op(
+                    self.s.entry,
+                    "coverage.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    91,
+                    &[],
+                ));
             }
             _ => return Val::Missing("a pixel system input"),
         };
@@ -2049,6 +2066,13 @@ impl<'a> Lower<'a> {
         if self.x.native.wave64 { 64 } else { 32 }
     }
 
+    /// Compute or mesh: the wave's index in the thread group.
+    fn wave_id(&mut self) -> V {
+        let f = self.mesh_thread();
+        let shift = self.s.m.i32(self.wave().trailing_zeros());
+        self.s.m.bin(self.s.entry, Bin::LShr, f, shift)
+    }
+
     fn lane_index(&mut self) -> V {
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
@@ -2904,6 +2928,17 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if name == "s_get_waveid_in_workgroup" {
+            if self.s.threads.is_none() {
+                return Err("s_get_waveid_in_workgroup outside compute");
+            }
+            let Some(Operand::Scalar { code, .. }) = *data else {
+                return Err(name);
+            };
+            let w = self.wave_id();
+            self.write(inst, Reg::S(code), w, None);
+            return Ok(());
+        }
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
@@ -7831,5 +7866,174 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[cfg(windows)]
+    fn validate(dxil: &[u8]) {
+        use super::super::validator::Validator;
+        let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        let mut copy = dxil.to_vec();
+        v.validate(&mut copy).unwrap();
+        assert_eq!(copy[4..20], dxil[4..20], "container hash");
+    }
+
+    #[cfg(not(windows))]
+    fn validate(_: &[u8]) {}
+
+    #[test]
+    fn group_info_and_waveid_in_workgroup_lower_and_validate() {
+        // s0 is the thread-group info SGPR (RSRC2 bit 10, TG_SIZE_EN);
+        // s_get_waveid_in_workgroup writes s1; a branch depending on both
+        // forces both values to be lowered.
+        let words = [
+            0xF4A8_0040,
+            0xFA00_0000, // s_get_waveid_in_workgroup s1
+            0xBF07_0100, // s_cmp_lg_u32 s0, s1
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE82_0380, // s_mov_b32 s2, 0
+            S_ENDPGM,
+        ];
+        for wave64 in [false, true] {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 1 << 10,
+                    threads: [64, 2, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let l = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap();
+            validate(&l.dxil);
+        }
+
+        // Outside compute or mesh stages there is no thread group: using the
+        // wave id in a branch fails with the reason.
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words[..2]
+                .iter()
+                .chain(&[
+                    0xBF07_8001, // s_cmp_lg_u32 s1, 0
+                    0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+                    0xBE82_0380, // s_mov_b32 s2, 0
+                    S_ENDPGM,
+                ])
+                .flat_map(|w| w.to_le_bytes())
+                .collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let err = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .err()
+        .unwrap();
+        assert!(
+            matches!(
+                err,
+                crate::ShaderError::Unsupported {
+                    what: "s_get_waveid_in_workgroup outside compute",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn sample_coverage_input_lowers_and_validates() {
+        use super::SigElement;
+        // SPI_PS_INPUT_ADDR bit 14 loads the sample coverage mask into v0.
+        let words = [
+            0x7E00_0D00, // v_cvt_f32_u32 v0, v0
+            0xF800_180F,
+            0x0000_0000, // exp mrt0 v0, v0, v0, v0 done vm
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 1 << 14,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let l = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![target],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+        validate(&l.dxil);
     }
 }
