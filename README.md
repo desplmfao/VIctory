@@ -20,6 +20,7 @@ Upstream base: Marvisak/VIctory `main` at `ffe310e`.
 | PR | Author | What it does |
 |----|--------|--------------|
 | [#185](https://github.com/Marvisak/VIctory/pull/185) via [aycow/VIctory#4](https://github.com/aycow/VIctory/pull/4) | aycow (merge with main: desplmfao) | Shadow-buffer coherency for directly indexed SRVs; includes [aycow/VIctory#2](https://github.com/aycow/VIctory/pull/2) (shared write-watch questions) |
+| [aycow/VIctory#3](https://github.com/aycow/VIctory/pull/3) | desplmfao | Caches view allocation lookups across refreshes (about 527k to 35k queries per world frame); belongs with #185 |
 | [#493](https://github.com/Marvisak/VIctory/pull/493) | hophaver | Root SRVs as one-view tables; fixes the hang at world entry |
 | [#259](https://github.com/Marvisak/VIctory/pull/259) | desplmfao | Query a descriptor's level count only when word 3 is read (NVIDIA pipeline crash) |
 | [#178](https://github.com/Marvisak/VIctory/pull/178) | Ortomanic | Compile the indirect-argument clamp with DXC when D3DCompile refuses it (Wine/Proton) |
@@ -45,7 +46,7 @@ world frame here).
 State of this stack (2026-11-24): boots and reaches the world at about
 1.5 fps and 4,000 draws per frame. The picture is mostly white, which earlier
 stacks without #180/#539 did not show; this is being investigated. The game
-process uses about 24 GB of memory in the world.
+process used about 24 GB of memory in the world before aycow/VIctory#3 was added.
 
 ## Status (2026-11-23)
 
