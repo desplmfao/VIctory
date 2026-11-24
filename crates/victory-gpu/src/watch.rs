@@ -131,6 +131,60 @@ fn private_from_basic(address: usize, start: usize) -> Option<bool> {
 /// and protection. Resolve this optionally so older Win32 providers still
 /// use the non-reset GetWriteWatch preflight.
 pub(crate) fn allocation(address: usize) -> Option<Allocation> {
+    // Views already looked up: a world frame's refresh asks for hundreds
+    // of thousands of ranges' reservations, each a system call (two under
+    // Wine), mostly for a few thousand views of title physical memory, and
+    // each comes up about once per refresh. The title's allocations
+    // elsewhere change the revision so often that an answer is rarely still
+    // live for its next use. Views are mapped and unmapped only through
+    // `title_memory_remapped`, which removes the entries its range overlaps
+    // (`record_mapping_change`), so an entry none has touched is still live
+    // at the current revision.
+    let mut cache = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, &found)) = cache.range(..=address).next_back()
+        && address < found.end
+    {
+        let revision = MAPPING_REVISION.load(Ordering::Acquire);
+        return Some(Allocation { revision, ..found });
+    }
+    // Asked while the cache is held: a mapping change reported meanwhile
+    // waits in `forget_allocations` and then removes what this inserts.
+    let found = query_allocation(address)?;
+    // Private memory is asked about every time: the title can allocate and
+    // free it through paths that report nothing here (its heap, for one),
+    // and a stale extent or commit size there would group or zero the wrong
+    // pages.
+    if !found.private {
+        cache.insert(found.start, found);
+    }
+    Some(found)
+}
+
+/// Views looked up, less those a mapping change has touched since.
+static ALLOCATIONS: Mutex<BTreeMap<usize, Allocation>> = Mutex::new(BTreeMap::new());
+
+/// Drops the looked-up reservations overlapping `[at, end)`.
+fn forget_allocations(at: usize, end: usize) {
+    let mut cache = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let stale: Vec<usize> = cache
+        .range(..end)
+        .rev()
+        .take_while(|(_, a)| a.end > at)
+        .map(|(&start, _)| start)
+        .collect();
+    for start in stale {
+        cache.remove(&start);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ALLOCATION_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn query_allocation(address: usize) -> Option<Allocation> {
+    #[cfg(test)]
+    ALLOCATION_QUERIES.with(|calls| calls.set(calls.get() + 1));
     use std::{ffi::c_void, sync::OnceLock};
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::{
@@ -584,6 +638,7 @@ fn forget_views(guards: &mut Guards, first: usize, last: usize) {
 }
 
 fn record_mapping_change(journal: &mut Journal, at: usize, end: usize) {
+    forget_allocations(at, end);
     MAPPING_REVISION.fetch_add(1, Ordering::Release);
     journal.asked += 1;
     Journal::record(
@@ -658,6 +713,55 @@ pub(crate) mod tests {
 
     /// A private reservation is reported private, a mapped view is not
     /// (Wine fills no region flags, so this checks the fallback there).
+    /// A view is asked about once until a mapping change over it; private
+    /// memory is asked about every time.
+    #[test]
+    fn view_lookups_are_cached_until_a_mapping_change() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile,
+        };
+        // SAFETY: a fresh section and views of ours, and a fresh reservation.
+        let (view, other, private) = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                2 * PAGE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * PAGE);
+            let other = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE);
+            CloseHandle(section);
+            let private =
+                VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            (view.Value as usize, other.Value as usize, private as usize)
+        };
+        assert!(view != 0 && other != 0 && private != 0);
+        let asked = || ALLOCATION_QUERIES.with(|calls| calls.get());
+        let Some(first) = allocation(view) else {
+            return;
+        };
+        assert!(!first.private);
+        let before = asked();
+        assert_eq!(allocation(view + PAGE).map(|a| a.start), Some(first.start));
+        assert_eq!(asked(), before, "answered from the cache");
+        // A change elsewhere leaves the entry, and it is still live.
+        title_memory_remapped(other, PAGE);
+        assert!(allocation(view).unwrap().is_live(), "live at the new revision");
+        assert_eq!(asked(), before, "a change elsewhere keeps the entry");
+        title_memory_remapped(view, PAGE);
+        assert!(allocation(view).is_some());
+        assert_eq!(asked(), before + 1, "asked again after a change over it");
+        assert!(allocation(private).unwrap().private);
+        assert!(allocation(private).is_some());
+        assert_eq!(asked(), before + 3, "private memory is asked about every time");
+        // Not unmapped or freed: the journal keeps the changes, and a later
+        // test given the same addresses would see them.
+    }
+
     #[test]
     fn allocation_tells_private_memory_from_views() {
         use windows_sys::Win32::Foundation::CloseHandle;
