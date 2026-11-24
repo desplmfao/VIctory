@@ -956,7 +956,7 @@ const fn buffer_load_mubuf(
 
 fn lower_compute_oob(native: &NativeProgram) -> HostShader {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let res = resource::track(&p, &native.layout, native.stage, crate::structure::structure(&p).ok().as_ref()).expect("resource::track");
     let io = io::raise(&p, native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
     let lowered = lower::lower(&lower::Parts {
@@ -980,6 +980,7 @@ fn lower_compute_oob(native: &NativeProgram) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        heap_buffer_srvs: lowered.heap_buffer_srvs,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

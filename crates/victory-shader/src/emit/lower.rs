@@ -7913,7 +7913,7 @@ mod tests {
                 code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
             };
             let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-            let res = resource::track(&p, &native.layout, native.stage).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, crate::structure::structure(&p).ok().as_ref()).unwrap();
             let io = io::raise(&p, &native).unwrap();
             let st = structure::structure(&p).unwrap();
             let l = lower(&Parts {
@@ -7957,7 +7957,7 @@ mod tests {
                 .collect(),
         };
         let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, crate::structure::structure(&p).ok().as_ref()).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
         let err = lower(&Parts {
@@ -8010,7 +8010,7 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, crate::structure::structure(&p).ok().as_ref()).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
         let target = SigElement {
