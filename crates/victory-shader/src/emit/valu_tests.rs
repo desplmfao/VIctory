@@ -5,7 +5,7 @@
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
 //! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, Root, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -937,4 +937,361 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+/// MUBUF `buffer_load_dword vdata, vaddr, s[srsrc:srsrc+3], 0 [idxen] [offen]`.
+const fn buffer_load_mubuf(
+    op: u32,
+    vdata: u8,
+    vaddr: u8,
+    srsrc: u8,
+    idxen: bool,
+    offen: bool,
+) -> [u32; 2] {
+    [
+        0x38 << 26 | op << 18 | (idxen as u32) << 13 | (offen as u32) << 12,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+fn lower_compute_oob(native: &NativeProgram) -> HostShader {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let st = structure::structure(&p).expect("structure");
+    let lowered = lower::lower(&lower::Parts {
+        native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    shader
+}
+
+fn build_oob_buffer_cs(
+    stride: u32,
+    load_op: u32,
+    idxen: bool,
+    offen: bool,
+    dwords: u8,
+) -> HostShader {
+    let mut words = Vec::new();
+    // s0 = root constant (index or byte offset); s[2:3] = descriptor table base.
+    words.push(s_mov_b32(3, 0x80)); // s3 = 0
+    let input = s_load_dwordx4(4, 2); // heap slot 0 -> s[4:7]
+    let mut output = s_load_dwordx4(8, 2); // heap slot 1 -> s[8:11]
+    output[1] |= 32;
+    words.extend_from_slice(&input);
+    words.extend_from_slice(&output);
+    words.push(vop1(0x001, 1, sgpr(0))); // v1 = s0
+    words.extend_from_slice(&buffer_load_mubuf(load_op, 4, 1, 4, idxen, offen));
+    for k in 0..dwords {
+        words.extend_from_slice(&buffer_store_dword(4 + k, 8, u16::from(k) * 4));
+    }
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 12,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 2,
+                slot: 1,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride,
+                dwords: 4,
+                user_data: 2,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 2,
+                slot: 1,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 3 << 1, // 3 user SGPRs: s0..s2
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    lower_compute_oob(&native)
+}
+
+fn dispatch_oob_case(
+    shader: &HostShader,
+    view_stride: Stride,
+    idx_or_off: u32,
+    out_dwords: u32,
+) -> Vec<u32> {
+    let data = [
+        0xCAFE_BABE,
+        0x1111_2222,
+        0x3333_4444,
+        0x5555_6666,
+        0x7777_8888,
+        0x9999_AAAA,
+        0xBBBB_CCCC,
+        0xDDDD_EEEE,
+    ];
+    let host = Host::new(false).expect("hardware SM 6.6 device");
+    let (root, pso) = host.compute_pipeline(shader).expect("compute_pipeline");
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        ud[u.index as usize] = match (u.root, u.slot) {
+            (RootType::Constants, 0) => idx_or_off,
+            (RootType::Table, 1) => 0,
+            other => panic!("unexpected user data {other:?}"),
+        };
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[
+                    View::Buffer {
+                        data: &data,
+                        stride: view_stride,
+                    },
+                    View::RawUav(out_dwords),
+                ],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    out[0].clone()
+}
+
+#[test]
+fn oob_structured_stride16_at_0x10000000() {
+    let shader = build_oob_buffer_cs(16, 0x0C, true, false, 1);
+    assert_eq!(
+        dispatch_oob_case(&shader, Stride::Structured(16), 0, 1),
+        [0xCAFE_BABE]
+    );
+    for &idx in &[0x1000_0000u32, 0xFFFF_FFFF, 0x8000_0000] {
+        eprintln!("testing structured stride=16 idx={idx:#010x}");
+        let got = dispatch_oob_case(&shader, Stride::Structured(16), idx, 1);
+        assert_eq!(
+            got,
+            [0],
+            "structured stride=16 idx={idx:#010x} must return 0"
+        );
+    }
+}
+
+#[test]
+fn oob_structured_stride4_at_0x40000000() {
+    let shader = build_oob_buffer_cs(4, 0x0C, true, false, 1);
+    assert_eq!(
+        dispatch_oob_case(&shader, Stride::Structured(4), 0, 1),
+        [0xCAFE_BABE]
+    );
+    for &idx in &[0x4000_0000u32, 0xFFFF_FFFF, 0x8000_0000] {
+        eprintln!("testing structured stride=4 idx={idx:#010x}");
+        let got = dispatch_oob_case(&shader, Stride::Structured(4), idx, 1);
+        assert_eq!(
+            got,
+            [0],
+            "structured stride=4 idx={idx:#010x} must return 0"
+        );
+    }
+}
+
+#[test]
+fn oob_raw_dwordx4_at_0xfffffffc() {
+    let shader = build_oob_buffer_cs(0, 0x0E, false, true, 4);
+    assert_eq!(
+        dispatch_oob_case(&shader, Stride::Raw, 0, 4),
+        [0xCAFE_BABE, 0x1111_2222, 0x3333_4444, 0x5555_6666]
+    );
+    for &off in &[0xFFFF_FFFCu32, 0xFFFF_FFF8, 0xFFFF_FFF4, 0xFFFF_FFF0] {
+        eprintln!("testing raw dwordx4 off={off:#010x}");
+        let got = dispatch_oob_case(&shader, Stride::Raw, off, 4);
+        assert_eq!(
+            got,
+            [0, 0, 0, 0],
+            "raw dwordx4 off={off:#010x} must return 0"
+        );
+    }
+}
+
+#[test]
+fn oob_structured_stride32_at_0x08000000() {
+    let shader = build_oob_buffer_cs(32, 0x0C, true, false, 1);
+    assert_eq!(
+        dispatch_oob_case(&shader, Stride::Structured(32), 0, 1),
+        [0xCAFE_BABE]
+    );
+    for &idx in &[0x0800_0000u32, 0x1000_0000, 0xFFFF_FFFF, 0x8000_0000] {
+        eprintln!("testing structured stride=32 idx={idx:#010x}");
+        let got = dispatch_oob_case(&shader, Stride::Structured(32), idx, 1);
+        assert_eq!(
+            got,
+            [0],
+            "structured stride=32 idx={idx:#010x} must return 0"
+        );
+    }
+}
+
+#[test]
+fn oob_raw_dword_high_offsets() {
+    let shader = build_oob_buffer_cs(0, 0x0C, false, true, 1);
+    assert_eq!(dispatch_oob_case(&shader, Stride::Raw, 0, 1), [0xCAFE_BABE]);
+    for &off in &[
+        0xFFFF_FFFCu32,
+        0xFFFF_FFFF,
+        0x8000_0000,
+        0x4000_0000,
+        0x1000_0000,
+    ] {
+        eprintln!("testing raw dword off={off:#010x}");
+        let got = dispatch_oob_case(&shader, Stride::Raw, off, 1);
+        assert_eq!(got, [0], "raw dword off={off:#010x} must return 0");
+    }
+}
+
+#[test]
+fn oob_raw_store_does_not_corrupt_element_zero() {
+    // Store 0x1111_2222 to offset 0, then store 0xDEAD_BEEF to an OOB offset `s0`.
+    // Element 0 must remain 0x1111_2222 (not overwritten by OOB clamping to 0).
+    let mut words = Vec::new();
+    words.push(s_mov_b32(3, 0x80)); // s3 = 0
+    let output = s_load_dwordx4(8, 2); // heap slot 0 -> s[8:11]
+    words.extend_from_slice(&output);
+    // v4 = 0x1111_2222 via literal
+    words.push(vop1(0x001, 4, 0xFF));
+    words.push(0x1111_2222);
+    // store v4 at offset 0
+    words.extend_from_slice(&buffer_store_dword(4, 8, 0));
+    // v1 = s0 (OOB byte offset), v5 = 0xDEAD_BEEF
+    words.push(vop1(0x001, 1, sgpr(0)));
+    words.push(vop1(0x001, 5, 0xFF));
+    words.push(0xDEAD_BEEF);
+    // buffer_store_dword v5, v1, s[8:11], 0 offen
+    words.extend_from_slice(&[
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | ((8u32 >> 2) & 0x1F) << 16 | (5u32 << 8) | 1,
+    ]);
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 2,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 2,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 3 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let shader = lower_compute_oob(&native);
+    let host = Host::new(false).expect("hardware SM 6.6 device");
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+    for &off in &[0xFFFF_FFFCu32, 0x8000_0000, 0xFFFF_FFF0] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) => off,
+                (RootType::Table, 1) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(4)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        assert_eq!(
+            out[0][0], 0x1111_2222,
+            "OOB raw store at {off:#010x} must not overwrite element 0"
+        );
+    }
 }
