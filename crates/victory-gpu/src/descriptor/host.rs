@@ -94,6 +94,20 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// Dynamic slots in a capped view heap; `VICTORY_CAPPED_DYNAMIC=<log2>`
+/// (diagnostics, 16 to 19) to try another split.
+fn capped_dynamic() -> u32 {
+    #[cfg(feature = "diagnostics")]
+    if let Some(bits) = std::env::var("VICTORY_CAPPED_DYNAMIC")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|b| (16..=19).contains(b))
+    {
+        return 1 << bits;
+    }
+    MIN_DYNAMIC
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -133,7 +147,9 @@ impl HostHeap {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    let dynamic = capped_dynamic();
+                    tracing::warn!(dynamic, title = PORTABLE_VIEWS - dynamic, "capped view heap split");
+                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - dynamic, dynamic)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
