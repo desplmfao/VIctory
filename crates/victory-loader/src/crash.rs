@@ -8,9 +8,12 @@
 //! exception too), is reported from the unhandled-exception filter
 //! (`report_unhandled`, which the runtime calls ahead of the title's own)
 //! and appended to the crash log, with the title's last debug output, which
-//! often states the reason. Panics of ours go to the crash log too.
+//! often states the reason. Diagnostics builds can also append first-chance
+//! breakpoints with `VICTORY_CRASH_BREAKPOINTS=1`. Panics of ours go to the
+//! crash log too.
 
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_PRIV_INSTRUCTION, EXCEPTION_STACK_OVERFLOW, HMODULE,
@@ -44,6 +47,9 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
 
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Read before installing the exception handler.
+static LOG_FIRST_CHANCE_BREAKPOINTS: AtomicBool = AtomicBool::new(false);
 
 /// Also appends every unhandled-exception report and panic to `file`, so a
 /// crash can be read after the console is gone.
@@ -115,6 +121,11 @@ pub fn report_crashes() {
         unsafe { report_unhandled(info) };
         EXCEPTION_CONTINUE_SEARCH
     }
+    LOG_FIRST_CHANCE_BREAKPOINTS.store(
+        cfg!(feature = "diagnostics")
+            && std::env::var_os("VICTORY_CRASH_BREAKPOINTS").is_some_and(|value| value == "1"),
+        Ordering::Relaxed,
+    );
     // SAFETY: registers handlers that only read the exception they are
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
@@ -159,16 +170,14 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                 let mut bytes = [0u8; 32];
                 let n = room.min(bytes.len());
                 std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
-                if let Some(pass) = clwb_loop(&bytes[..n]) {
+                if let Some(pass) = clwb_loop(&bytes[..n])
+                    && let Some(end) =
+                        clwb_loop_end(*gpr(context, pass.base), *gpr(context, pass.limit))
+                {
                     // A whole write-back loop in one exception (see `clwb_loop`).
                     let limit = *gpr(context, pass.limit);
-                    let base = gpr(context, pass.base);
-                    *base = if *base <= limit {
-                        base.wrapping_add(((limit - *base) / 64 + 1) * 64)
-                    } else {
-                        base.wrapping_add(64)
-                    };
-                    let flags = cmp_flags(*base, limit);
+                    *gpr(context, pass.base) = end;
+                    let flags = cmp_flags(end, limit);
                     context.EFlags = context.EFlags & !CMP_FLAGS | flags;
                     context.Rip += pass.len as u64;
                     return true;
@@ -237,6 +246,19 @@ struct ClwbLoop {
     limit: u8,
     /// Bytes from `clwb` to the instruction after `jbe`.
     len: usize,
+}
+
+/// The `base` value left after a `clwb_loop` finishes without wrapping past
+/// `u64::MAX`, or `None` if `add base, 0x40` would overflow or wrap (in which
+/// case we fall through to single-instruction `clwb` emulation).
+fn clwb_loop_end(base: u64, limit: u64) -> Option<u64> {
+    let step = if base <= limit {
+        ((limit - base) / 64 + 1).checked_mul(64)?
+    } else {
+        64
+    };
+    let end = base.checked_add(step)?;
+    (end > limit).then_some(end)
 }
 
 fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
@@ -362,9 +384,12 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
-    if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
+    let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
+    if FATAL.contains(&code) {
+        let to_file =
+            code == EXCEPTION_BREAKPOINT && LOG_FIRST_CHANCE_BREAKPOINTS.load(Ordering::Relaxed);
         // SAFETY: as above.
-        unsafe { report("first-chance exception", info, false) };
+        unsafe { report("first-chance exception", info, to_file) };
     }
     EXCEPTION_CONTINUE_SEARCH
 }
@@ -747,6 +772,46 @@ mod tests {
         // The flags the last cmp leaves: base just past limit.
         assert_eq!(cmp_flags(0x1040, 0x1000) & 0x41, 0); // CF and ZF clear: the loop ends
         assert_eq!(cmp_flags(0x1000, 0x1000) & 0x40, 0x40);
+    }
+
+    #[test]
+    fn clwb_loop_wrapping_ranges_do_not_overflow_and_fall_back_to_single_clwb() {
+        assert_eq!(clwb_loop_end(0x1000, 0x1080), Some(0x10c0));
+        assert_eq!(clwb_loop_end(0x10c0, 0x1080), Some(0x1100));
+        assert_eq!(clwb_loop_end(0, u64::MAX - 10), None);
+        assert_eq!(clwb_loop_end(u64::MAX - 16, 0x100), None);
+        assert_eq!(clwb_loop_end(u64::MAX - 63, u64::MAX), None);
+
+        // clwb [rcx]; add rcx, 0x40; cmp rcx, rax; jbe top (13 bytes, clwb is 4 bytes).
+        let mut bytes = [0xcc_u8; 16];
+        bytes[..13].copy_from_slice(&[
+            0x66, 0x0f, 0xae, 0x31, 0x48, 0x83, 0xc1, 0x40, 0x48, 0x39, 0xc1, 0x76, 0xf3,
+        ]);
+        let run = |base: u64, limit: u64| -> (u64, u64) {
+            let start = bytes.as_ptr() as u64;
+            // SAFETY: zeroed record/context are valid; `emulate_amd_only` only
+            // reads `bytes` and updates `context`.
+            unsafe {
+                let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+                record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+                let mut context: CONTEXT = std::mem::zeroed();
+                context.Rip = start;
+                context.Rcx = base;
+                context.Rax = limit;
+                let mut pointers = EXCEPTION_POINTERS {
+                    ExceptionRecord: &mut record,
+                    ContextRecord: &mut context,
+                };
+                assert!(emulate_amd_only(&mut pointers));
+                (context.Rip - start, context.Rcx)
+            }
+        };
+        // Normal range completes the whole 13-byte loop in one exception.
+        assert_eq!(run(0x1000, 0x1080), (13, 0x10c0));
+        // Overflowing/wrapping ranges must not panic or skip the loop: emulate
+        // just the 4-byte `clwb` instruction and let the CPU run add/cmp/jbe.
+        assert_eq!(run(0, u64::MAX - 10), (4, 0));
+        assert_eq!(run(u64::MAX - 16, 0x100), (4, u64::MAX - 16));
     }
 
     #[test]
