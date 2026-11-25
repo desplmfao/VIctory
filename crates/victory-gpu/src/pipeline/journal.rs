@@ -23,6 +23,12 @@
 //! does not end the process (see `soft_crash`): the pipeline goes into
 //! `crashed.txt` at once, and is refused for the rest of the run even with
 //! the journal off.
+//!
+//! `crashed.txt` starts with the translator that was running when its
+//! pipelines ended a run (`# translator <hash>`). Under another translator
+//! (or in a list without that line) they may well be made now, so they are
+//! not refused: each becomes a suspect, created alone, and is listed again
+//! if it ends the run again.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -31,6 +37,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// The line of `crashed.txt` that names the translator its pipelines
+/// crashed under.
+const TRANSLATOR: &str = "# translator ";
 
 struct Journal {
     pending: PathBuf,
@@ -60,7 +70,7 @@ fn journal() -> Option<&'static Journal> {
                 tracing::warn!("VICTORY_PIPELINE_JOURNAL: no cache folder; journal off");
                 return None;
             };
-            Journal::open(dir, process_running)
+            Journal::open(dir, victory_shader::SOURCE_HASH, process_running)
         })
         .as_ref()
 }
@@ -128,9 +138,10 @@ fn write_list<'a>(path: &Path, keys: impl IntoIterator<Item = &'a String>) {
 impl Journal {
     /// The journal in `dir`, with the notes a run that ended while creating
     /// pipelines left sorted into `crashed.txt` or `suspects.txt`.
+    /// `translator` names the translator of this run (its source hash).
     /// `running` says whether a process id is still running: notes of a
     /// running process (another instance) are left alone.
-    fn open(dir: &Path, running: impl Fn(u32) -> bool) -> Option<Journal> {
+    fn open(dir: &Path, translator: &str, running: impl Fn(u32) -> bool) -> Option<Journal> {
         let pending = dir.join("pending");
         let crashed_file = dir.join("crashed.txt");
         let suspects_file = dir.join("suspects.txt");
@@ -140,6 +151,27 @@ impl Journal {
         }
         let mut crashed = read_list(&crashed_file);
         let mut suspects = read_list(&suspects_file);
+        let listed_under = std::fs::read_to_string(&crashed_file)
+            .unwrap_or_default()
+            .lines()
+            .find_map(|l| l.strip_prefix(TRANSLATOR).map(|t| t.trim().to_owned()));
+        if listed_under.as_deref() != Some(translator) {
+            if !crashed.is_empty() {
+                let mut retried: Vec<&String> = crashed.iter().collect();
+                retried.sort();
+                tracing::info!(
+                    pipelines = ?retried,
+                    listed_under = listed_under.as_deref().unwrap_or("unknown"),
+                    translator,
+                    "these host pipelines ended a run under another translator: each is tried again, alone"
+                );
+                suspects.extend(crashed.drain());
+                write_list(&suspects_file, &suspects);
+            }
+            if let Err(e) = std::fs::write(&crashed_file, format!("{TRANSLATOR}{translator}\n")) {
+                tracing::warn!(error = %e, path = %crashed_file.display(), "crashed pipeline list not reset");
+            }
+        }
         // (key, its stages and container sizes, as the note names them)
         let mut left: Vec<(String, String)> = Vec::new();
         for entry in std::fs::read_dir(&pending).into_iter().flatten().flatten() {
@@ -354,18 +386,21 @@ mod tests {
     fn a_note_left_by_a_crash_refuses_that_pipeline_from_then_on() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let j = Journal::open(dir.path(), |_| false).unwrap();
+            let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
             let done = j.enter("aaaaaaaaaaaaaaaa", "").unwrap();
             drop(done);
             let crashing = j.enter("bbbbbbbbbbbbbbbb+cccccccccccccccc", "").unwrap();
             // The process ends here: the note stays.
             std::mem::forget(crashing);
         }
-        let j = Journal::open(dir.path(), |_| false).unwrap();
+        let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
         assert!(j.enter("bbbbbbbbbbbbbbbb+cccccccccccccccc", "").is_none());
         assert!(j.enter("aaaaaaaaaaaaaaaa", "").is_some());
         let listed = std::fs::read_to_string(dir.path().join("crashed.txt")).unwrap();
-        assert_eq!(listed, "bbbbbbbbbbbbbbbb+cccccccccccccccc\n");
+        assert_eq!(
+            listed,
+            "# translator t1\nbbbbbbbbbbbbbbbb+cccccccccccccccc\n"
+        );
         assert_eq!(
             std::fs::read_dir(dir.path().join("pending"))
                 .unwrap()
@@ -378,15 +413,15 @@ mod tests {
     fn notes_left_by_pipelines_created_together_make_suspects_that_run_alone() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let j = Journal::open(dir.path(), |_| false).unwrap();
+            let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
             // Two pipelines in creation at once when the process ends.
             std::mem::forget(j.enter("eeeeeeeeeeeeeeee", "").unwrap());
             std::mem::forget(j.enter("ffffffffffffffff", "").unwrap());
         }
-        let j = Journal::open(dir.path(), |_| false).unwrap();
+        let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("crashed.txt")).unwrap_or_default(),
-            ""
+            "# translator t1\n"
         );
         let suspects = std::fs::read_to_string(dir.path().join("suspects.txt")).unwrap();
         assert_eq!(suspects, "eeeeeeeeeeeeeeee\nffffffffffffffff\n");
@@ -400,7 +435,7 @@ mod tests {
         // Created alone again, it crashes: now it is named.
         std::mem::forget(j.enter("ffffffffffffffff", "").unwrap());
         drop(j);
-        let j = Journal::open(dir.path(), |_| false).unwrap();
+        let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
         assert!(j.enter("ffffffffffffffff", "").is_none());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("suspects.txt")).unwrap(),
@@ -412,7 +447,7 @@ mod tests {
     fn a_crashed_pipeline_is_listed_with_its_stages_and_sizes() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let j = Journal::open(dir.path(), |_| false).unwrap();
+            let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
             std::mem::forget(
                 j.enter(
                     "1234123412341234+5678567856785678",
@@ -429,11 +464,11 @@ mod tests {
                 names[0].starts_with("1234123412341234+5678567856785678@vertex-1024+pixel-2048@")
             );
         }
-        let j = Journal::open(dir.path(), |_| false).unwrap();
+        let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
         assert!(j.enter("1234123412341234+5678567856785678", "").is_none());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("crashed.txt")).unwrap(),
-            "# vertex-1024 + pixel-2048\n1234123412341234+5678567856785678\n"
+            "# translator t1\n# vertex-1024 + pixel-2048\n1234123412341234+5678567856785678\n"
         );
     }
 
@@ -444,16 +479,16 @@ mod tests {
         std::fs::create_dir_all(&pending).unwrap();
         // Another instance (process 4242) is creating this pipeline now.
         std::fs::write(pending.join("abababababababab@compute-100@4242-7"), "").unwrap();
-        let j = Journal::open(dir.path(), |p| p == 4242).unwrap();
+        let j = Journal::open(dir.path(), "t1", |p| p == 4242).unwrap();
         assert!(j.enter("abababababababab", "").is_some());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("crashed.txt")).unwrap_or_default(),
-            ""
+            "# translator t1\n"
         );
         assert!(pending.join("abababababababab@compute-100@4242-7").exists());
         // Once that process is gone, the note it left counts.
         drop(j);
-        let j = Journal::open(dir.path(), |_| false).unwrap();
+        let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
         assert!(j.enter("abababababababab", "").is_none());
     }
 
@@ -465,7 +500,7 @@ mod tests {
     #[test]
     fn ordinary_pipelines_are_created_together() {
         let dir = tempfile::tempdir().unwrap();
-        let j = Journal::open(dir.path(), |_| false).unwrap();
+        let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
         let a = j.enter("1111111111111111", "").unwrap();
         let b = j.enter("2222222222222222", "").unwrap();
         drop((a, b));
@@ -483,28 +518,76 @@ mod tests {
         .unwrap()
         .unwrap_err();
         {
-            let j = Journal::open(dir.path(), |_| false).unwrap();
+            let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
             let pending = j.enter("9999999999999999+8888888888888888", "vertex-64+pixel-32").unwrap();
             j.faulted("9999999999999999+8888888888888888", "vertex-64+pixel-32", fault.code);
             drop(pending);
         }
         assert_eq!(
             std::fs::read_to_string(dir.path().join("crashed.txt")).unwrap(),
-            "# vertex-64 + pixel-32 (fault 0xc0000005)\n9999999999999999+8888888888888888\n"
+            "# translator t1\n# vertex-64 + pixel-32 (fault 0xc0000005)\n9999999999999999+8888888888888888\n"
         );
-        let j = Journal::open(dir.path(), |_| false).unwrap();
+        let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
         assert!(j.enter("9999999999999999+8888888888888888", "").is_none());
         // In this run, with the journal on or off.
         faulted("7777777777777777", "compute-16", fault.code, fault.address);
         assert!(enter("7777777777777777", "").is_none());
         assert!(enter("6666666666666666", "").is_some());
+    fn a_pipeline_that_crashed_under_another_translator_is_tried_again_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("crashed.txt"),
+            "# translator old\n# compute-3360\n9999999999999999\n",
+        )
+        .unwrap();
+        let j = Journal::open(dir.path(), "new", |_| false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("crashed.txt")).unwrap(),
+            "# translator new\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("suspects.txt")).unwrap(),
+            "9999999999999999\n"
+        );
+        // Tried again alone; it ends the run again, so it is listed again,
+        // now under this translator.
+        let alone = j.enter("9999999999999999", "compute-3360").unwrap();
+        assert!(j.gate.try_read().is_err());
+        std::mem::forget(alone);
+        drop(j);
+        let j = Journal::open(dir.path(), "new", |_| false).unwrap();
+        assert!(j.enter("9999999999999999", "").is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("crashed.txt")).unwrap(),
+            "# translator new\n# compute-3360\n9999999999999999\n"
+        );
+    }
+
+    #[test]
+    fn under_the_same_translator_a_crashed_pipeline_stays_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("crashed.txt"),
+            "# translator t1\n7777777777777777\n",
+        )
+        .unwrap();
+        let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
+        assert!(j.enter("7777777777777777", "").is_none());
+    }
+
+    #[test]
+    fn a_list_without_its_translator_is_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("crashed.txt"), "8888888888888888\n").unwrap();
+        let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
+        assert!(j.enter("8888888888888888", "").is_some());
     }
 
     #[test]
     fn a_line_removed_from_the_list_is_tried_again() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("crashed.txt"), "# tried again\n").unwrap();
-        let j = Journal::open(dir.path(), |_| false).unwrap();
+        let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
         assert!(j.enter("dddddddddddddddd", "").is_some());
     }
 }
