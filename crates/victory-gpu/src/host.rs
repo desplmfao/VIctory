@@ -1014,6 +1014,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Keys of what [`HostList::keep_once`] kept.
+    kept_once: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -2379,6 +2381,18 @@ impl HostList {
         }
     }
 
+    /// [`HostList::keep`], once per `key` until the list is reset (for
+    /// objects the list's commands name many times; `key` must not be given
+    /// to another object while this one is kept: its address, say).
+    pub(crate) fn keep_once(&self, key: usize, object: &impl Interface) {
+        let mut deferred = self.deferred();
+        if deferred.kept_once.insert(key)
+            && let Ok(object) = object.cast::<windows::core::IUnknown>()
+        {
+            deferred.kept.push(object);
+        }
+    }
+
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
@@ -2962,6 +2976,7 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
         crate::memory::log_frame();
+        crate::shadow::check_in_place();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
         #[cfg(feature = "diagnostics")]
