@@ -8,6 +8,47 @@ the platform underneath it and converts the title's data, ahead of time where
 it can (shaders and pipelines too, see Getting started) and on first use
 otherwise. See [docs/architecture.md](docs/architecture.md).
 
+## This fork: the PRs we run (Linux, NVIDIA)
+
+This fork's `main` is upstream `main` plus a stack of open pull requests that we
+test together on Linux (CachyOS, proton-cachyos 11.0 with Proton Experimental's
+vkd3d-proton 3.2.0, RTX 5080 16 GB, 60 GB RAM). Upstream only takes pull
+requests from collaborators now, so this branch keeps track of what we use.
+Clone it and build as described below. The previous stack (built on #185) is
+kept as the branch `main-2026-11-24`.
+
+Upstream base: Marvisak/VIctory `main` at `940d32f`.
+
+| PR | Author | What it does |
+|----|--------|--------------|
+| [#2143](https://github.com/Marvisak/VIctory/pull/2143) | desplmfao | A program's constant table starts after its instructions: NVIDIA kept whole-program tables in per-thread local memory (GBs of video memory); without it the world does not fit in 16 GB |
+| [#1849](https://github.com/Marvisak/VIctory/pull/1849) | crashbashash | Guarded free memory; fixes the world freeze under Wine ([#1921](https://github.com/Marvisak/VIctory/issues/1921)) |
+| [#259](https://github.com/Marvisak/VIctory/pull/259) | desplmfao | Query a descriptor's level count only when word 3 is read (NVIDIA pipeline crash) |
+| [#177](https://github.com/Marvisak/VIctory/pull/177) (one commit) | Ortomanic | Key heap handles by element type; without it NVIDIA crashes creating several compute pipelines |
+| [#491](https://github.com/Marvisak/VIctory/pull/491) | desplmfao | `VICTORY_PIPELINE_JOURNAL=1`: skip pipelines whose creation crashed an earlier run (the NVIDIA compiler ends the process on some; a fresh build can take a few runs to list them) |
+| [#2153](https://github.com/Marvisak/VIctory/pull/2153) | SaymonMaster14 ([#472](https://github.com/Marvisak/VIctory/pull/472)), rebased by desplmfao | Caps the idle snapshot pool (2 GB less RAM in the world) and shares one texture staging buffer |
+| [#2099](https://github.com/Marvisak/VIctory/pull/2099) | 0xkn0wh3r3 | The descriptor view table stops growing (about 200 MB more RAM every 30 s in the world without it) |
+| [#2071](https://github.com/Marvisak/VIctory/pull/2071) | 0xkn0wh3r3 | Frees the executable's bytes once loaded (228 MB) |
+| [#2088](https://github.com/Marvisak/VIctory/pull/2088) | kxiserino ([#402](https://github.com/Marvisak/VIctory/pull/402)), desplmfao | Reuses loose windows that hold a range; 256 KiB windows instead of 4 MiB |
+| [#2112](https://github.com/Marvisak/VIctory/pull/2112) | desplmfao | Opt-in (`VICTORY_IN_PLACE=1`): title memory read in place instead of copied; on vkd3d-proton only allocations already 90% resident (opening one pins all of it) |
+| [#2162](https://github.com/Marvisak/VIctory/pull/2162) | desplmfao | Depth twins share their scratch buffers (about 280 MB video memory) |
+
+Running under Proton is much faster with the wineserver patch from
+[#340](https://github.com/Marvisak/VIctory/issues/340); see
+[#2082](https://github.com/Marvisak/VIctory/pull/2082) for how to build it
+(about 4 s to 1 s per world frame here).
+
+State of this stack (2026-11-25): boots and reaches the world (about 2,000
+draws per frame, 430–550 ms per frame). In the world the game process uses
+about 14–16 GB of RAM (VIctory's own heap about 1.4 GB, flat) and about
+12 GB of video memory, of which about 9 GB are textures and about 2 GB are
+inside the NVIDIA driver. Known problems: most of the world is not drawn yet,
+because NVIDIA refuses the title's wave64 compute shaders (r4tedx's
+[#233](https://github.com/Marvisak/VIctory/pull/233) stack works on it), and
+in about one run in three the GPU hangs at the start of the first mission
+(`Unsignaled CrossQueueBarrier` in the title's crash log, NVIDIA Xid 109;
+see [#1323](https://github.com/Marvisak/VIctory/issues/1323)).
+
 ## Status (2026-11-24)
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps,
