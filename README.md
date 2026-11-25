@@ -55,9 +55,12 @@ cargo build --profile diag -p victory --features diagnostics --target x86_64-pc-
 # next to victory.exe: vkd3d-proton's d3d12.dll, d3d12core.dll and Microsoft's d3dcompiler_47.dll
 WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,d3dcompiler_47=n,b" \
 VICTORY_PIPELINE_JOURNAL=1 \
-VICTORY_SKIP_PIPELINES=72f552f4553fb5f9,28918b7150a7aad5,4ddd6f9702fab2a7,caa78b8ca62bc3d6   # see below: with #2167 the last three can go \
+VICTORY_SKIP_PIPELINES=72f552f4553fb5f9,28918b7150a7aad5,4ddd6f9702fab2a7,caa78b8ca62bc3d6 \
 proton runinprefix victory.exe run <game exe> --execute --console series-x
 ```
+
+With #2167 in this branch, the three `XboxBvhBuilder` passes finish in time
+and can be left out of the list; the hair passes still hang (being looked at).
 
 Optional: set `<motionBlur value="false" />` in the title's
 `storage/settings/settings.xml` (in the data folder); the picture is far
