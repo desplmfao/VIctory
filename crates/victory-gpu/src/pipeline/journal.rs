@@ -255,10 +255,19 @@ impl Journal {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains(key);
-        let gate = if suspect {
-            Gate::Alone(self.gate.write().unwrap_or_else(|e| e.into_inner()))
+        // A thread that already holds the gate (a pipeline whose creation
+        // makes another, e.g. a helper) does not take it again: taking it
+        // twice on one thread deadlocks, against itself when it holds it
+        // alone, or behind a suspect waiting to hold it alone.
+        let gate = if HOLDS_GATE.get() {
+            None
         } else {
-            Gate::Shared(self.gate.read().unwrap_or_else(|e| e.into_inner()))
+            HOLDS_GATE.set(true);
+            Some(if suspect {
+                Gate::Alone(self.gate.write().unwrap_or_else(|e| e.into_inner()))
+            } else {
+                Gate::Shared(self.gate.read().unwrap_or_else(|e| e.into_inner()))
+            })
         };
         let detail = if detail.is_empty() {
             String::new()
@@ -280,7 +289,7 @@ impl Journal {
         Some(Pending {
             note,
             cleared: suspect.then(|| (self, key.to_owned())),
-            _gate: Some(gate),
+            _gate: gate,
         })
     }
 
@@ -307,8 +316,16 @@ pub(crate) struct Pending<'a> {
     _gate: Option<Gate<'a>>,
 }
 
+thread_local! {
+    /// This thread holds the gate (through a [`Pending`] not yet dropped).
+    static HOLDS_GATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Drop for Pending<'_> {
     fn drop(&mut self) {
+        if self._gate.take().is_some() {
+            HOLDS_GATE.set(false);
+        }
         if let Some(path) = &self.note {
             let _ = std::fs::remove_file(path);
         }
@@ -335,6 +352,13 @@ pub(crate) fn enter(key: &str, detail: &str) -> Option<Pending<'static>> {
 mod tests {
     use super::*;
 
+    /// The process ends while `p` is being created: its note stays. (A
+    /// real crash ends the thread too, so its hold on the gate goes.)
+    fn crash(p: Pending<'_>) {
+        std::mem::forget(p);
+        HOLDS_GATE.set(false);
+    }
+
     #[test]
     fn a_note_left_by_a_crash_refuses_that_pipeline_from_then_on() {
         let dir = tempfile::tempdir().unwrap();
@@ -344,7 +368,7 @@ mod tests {
             drop(done);
             let crashing = j.enter("bbbbbbbbbbbbbbbb+cccccccccccccccc", "").unwrap();
             // The process ends here: the note stays.
-            std::mem::forget(crashing);
+            crash(crashing);
         }
         let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
         assert!(j.enter("bbbbbbbbbbbbbbbb+cccccccccccccccc", "").is_none());
@@ -368,8 +392,8 @@ mod tests {
         {
             let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
             // Two pipelines in creation at once when the process ends.
-            std::mem::forget(j.enter("eeeeeeeeeeeeeeee", "").unwrap());
-            std::mem::forget(j.enter("ffffffffffffffff", "").unwrap());
+            crash(j.enter("eeeeeeeeeeeeeeee", "").unwrap());
+            crash(j.enter("ffffffffffffffff", "").unwrap());
         }
         let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
         assert_eq!(
@@ -386,7 +410,7 @@ mod tests {
         let suspects = std::fs::read_to_string(dir.path().join("suspects.txt")).unwrap();
         assert_eq!(suspects, "ffffffffffffffff\n");
         // Created alone again, it crashes: now it is named.
-        std::mem::forget(j.enter("ffffffffffffffff", "").unwrap());
+        crash(j.enter("ffffffffffffffff", "").unwrap());
         drop(j);
         let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
         assert!(j.enter("ffffffffffffffff", "").is_none());
@@ -401,7 +425,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
-            std::mem::forget(
+            crash(
                 j.enter(
                     "1234123412341234+5678567856785678",
                     "vertex-1024+pixel-2048",
@@ -480,7 +504,7 @@ mod tests {
         // now under this translator.
         let alone = j.enter("9999999999999999", "compute-3360").unwrap();
         assert!(j.gate.try_read().is_err());
-        std::mem::forget(alone);
+        crash(alone);
         drop(j);
         let j = Journal::open(dir.path(), "new", |_| false).unwrap();
         assert!(j.enter("9999999999999999", "").is_none());
@@ -508,6 +532,32 @@ mod tests {
         std::fs::write(dir.path().join("crashed.txt"), "8888888888888888\n").unwrap();
         let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
         assert!(j.enter("8888888888888888", "").is_some());
+    }
+
+    /// A pipeline made while this thread already holds the gate (a helper
+    /// made inside another's creation) does not take it again: alone (a
+    /// suspect) or shared behind a waiting suspect, that deadlocked.
+    #[test]
+    fn a_nested_pipeline_does_not_take_the_gate_again() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("suspects.txt"), "aaaaaaaaaaaaaaaa\n").unwrap();
+        let path = dir.path().to_path_buf();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let j = Journal::open(&path, "t1", |_| false).unwrap();
+            // A suspect holds the gate alone and makes a helper pipeline.
+            let outer = j.enter("aaaaaaaaaaaaaaaa", "").unwrap();
+            let inner = j.enter("bbbbbbbbbbbbbbbb", "").unwrap();
+            drop(inner);
+            drop(outer);
+            // And the gate is free again for the next pipeline.
+            drop(j.enter("cccccccccccccccc", "").unwrap());
+            let _ = done.send(());
+        });
+        assert!(
+            finished.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "a nested pipeline deadlocked on the gate"
+        );
     }
 
     #[test]
