@@ -19,6 +19,13 @@ kept as the branch `main-2026-11-24`.
 
 Upstream base: Marvisak/VIctory `main` at `940d32f`.
 
+**Rendering work is on the [`renderer`](https://github.com/desplmfao/VIctory/tree/renderer)
+branch** (this `main` plus #439, the rendering pull requests and our fixes).
+There the world is drawn on NVIDIA under Linux, without the GPU timeouts.
+Its README has the settings that takes, including Microsoft's
+`d3dcompiler_47.dll`: without it, Wine's compiler makes VIctory drop every
+indirect draw.
+
 | PR | Author | What it does |
 |----|--------|--------------|
 | [#2143](https://github.com/Marvisak/VIctory/pull/2143) | desplmfao | A program's constant table starts after its instructions: NVIDIA kept whole-program tables in per-thread local memory (GBs of video memory); without it the world does not fit in 16 GB |
