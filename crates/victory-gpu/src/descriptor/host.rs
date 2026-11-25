@@ -50,8 +50,10 @@ pub(crate) struct HostHeap {
     /// view there, `VIEW_MARK_NONE` for none. Mapped at the address kept
     /// beside it.
     marks: Option<(ID3D12Resource, usize)>,
-    /// Per title slot, the console descriptor's dwords 0-3 as far as the
-    /// host knows them (shaders reading a descriptor as data, `crate::memory`;
+    /// Per title slot and per dynamic slot (tables made afresh lie there,
+    /// and shaders index the view addresses at the slots their tables are
+    /// in), the console descriptor's dwords 0-3 as far as the host knows
+    /// them (shaders reading a descriptor as data, `crate::memory`;
     /// [`write_address`]): the buffer, its mapping and host address, made on
     /// first use.
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
@@ -393,6 +395,9 @@ impl HostHeap {
         self.keep(index, kept.flatten());
         self.set_stride(index, Some(view));
         self.set_mark(index, mark);
+        // A table made afresh: shaders reading a view's address there (e.g.
+        // the BVH builder's base) index the view addresses at this slot.
+        self.note_address(index, Some(view));
     }
 
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
@@ -450,6 +455,8 @@ impl HostHeap {
         self.keep(index, buffer.map(|b| (b.clone(), None)));
         self.write_stride(index, 4);
         self.set_mark(index, None);
+        // Not a title view: no entry an earlier table left there stays.
+        self.note_address(index, None);
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -462,6 +469,7 @@ impl HostHeap {
         self.keep(index, None);
         self.set_stride(index, None);
         self.set_mark(index, None);
+        self.note_address(index, None);
         if index < self.count {
             self.viewed.set(index, None, false);
         }
@@ -542,13 +550,23 @@ impl HostHeap {
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
         let made = self.addresses.get_or_init(|| {
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 16)?;
+            // The view is a root view, which has no bounds: an entry for
+            // every slot a table can lie in, the dynamic ones too (a table
+            // made afresh on a host whose heap is smaller than the title's
+            // read past the title slots' entries: whatever followed the
+            // buffer, or a GPU fault).
+            let (buffer, data) = host()?.upload_buffer(u64::from(self.address_slots()) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             for (i, &key) in made.iter().enumerate() {
                 let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
                 write_address(data, i, view.as_ref());
+            }
+            // Dynamic slots are entered as they are made ([`Self::make_at`],
+            // [`Self::make_null`], raw views).
+            for i in self.count..self.address_slots() {
+                write_address(data, i as usize, None);
             }
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -557,9 +575,17 @@ impl HostHeap {
         made.as_ref().map(|m| m.2)
     }
 
+    /// The slots the view addresses have an entry for: the title's and the
+    /// dynamic ones.
+    fn address_slots(&self) -> u32 {
+        self.count + self.dynamic
+    }
+
     /// Slot `index` now holds `view` (or no view): its view address.
     fn note_address(&self, index: u32, view: Option<&View>) {
-        if let Some(Some((_, data, _))) = self.addresses.get() {
+        if index < self.address_slots()
+            && let Some(Some((_, data, _))) = self.addresses.get()
+        {
             write_address(*data, index as usize, view);
         }
     }
@@ -611,6 +637,9 @@ impl HostHeap {
         // Writes through these are title memory's, marked in its page table.
         self.set_mark(index, None);
         self.set_mark(index + 1, None);
+        // Not a title view: no entry an earlier table left there stays.
+        self.note_address(index, None);
+        self.note_address(index + 1, None);
     }
 
     /// The shader-visible handle of slot `index`.
@@ -988,8 +1017,9 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// Writes slot `index`'s words into the view addresses at `data`, 16 bytes
-/// a slot: a buffer view's title address (dword 0 low, dword 1 bits 0-15
+/// Writes slot `index`'s words into the view addresses at `data` (the
+/// caller keeps `index` below [`HostHeap::address_slots`]), 16 bytes a
+/// slot: a buffer view's title address (dword 0 low, dword 1 bits 0-15
 /// high), a texture view's size fields ([`texture_words`]), zeros for
 /// anything else.
 fn write_address(data: usize, index: usize, view: Option<&View>) {
@@ -998,7 +1028,8 @@ fn write_address(data: usize, index: usize, view: Option<&View>) {
         Some(words) => words,
         None => [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0],
     };
-    // SAFETY: the mapped view addresses hold 16 bytes per title slot.
+    // SAFETY: the mapped view addresses hold 16 bytes per title and dynamic
+    // slot (below `address_slots`).
     unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
 }
 
