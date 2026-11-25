@@ -8,13 +8,15 @@ the platform underneath it and converts the title's data, ahead of time where
 it can (shaders and pipelines too, see Getting started) and on first use
 otherwise. See [docs/architecture.md](docs/architecture.md).
 
-## This fork: the PRs we run (Linux, NVIDIA)
+## This branch (`renderer`): the fork's `main` plus the rendering work
 
-This fork's `main` is upstream `main` plus a stack of open pull requests that we
+The fork's `main` is upstream `main` plus small fixes (open pull requests) that we
 test together on Linux (CachyOS, proton-cachyos 11.0 with Proton Experimental's
 vkd3d-proton 3.2.0, RTX 5080 16 GB, 60 GB RAM). Upstream only takes pull
-requests from collaborators now, so this branch keeps track of what we use.
-Earlier stacks are kept as the branches `main-2026-11-25-a` and `main-2026-11-24`.
+requests from collaborators now, so the fork keeps track of what we use.
+This `renderer` branch adds the rendering work on top: #439 and the rendering
+pull requests, our fix for vkd3d-proton, and two diagnostics tools. It is
+what draws the world (below); `main` stays the smaller, steadier stack.
 
 Upstream base: Marvisak/VIctory `main` at `940d32f`.
 
