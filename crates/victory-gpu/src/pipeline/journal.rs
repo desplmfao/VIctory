@@ -533,6 +533,9 @@ mod tests {
         faulted("7777777777777777", "compute-16", fault.code, fault.address);
         assert!(enter("7777777777777777", "").is_none());
         assert!(enter("6666666666666666", "").is_some());
+    }
+
+    #[test]
     fn a_pipeline_that_crashed_under_another_translator_is_tried_again_alone() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
