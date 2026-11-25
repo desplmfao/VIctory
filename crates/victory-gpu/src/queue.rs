@@ -121,10 +121,29 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let mut held = held();
+        let mut skipped = 0;
         for &l in lists {
-            for segment in crate::list::segments(l) {
-                let waits = segment.waits();
-                held.push(this as usize, Item::Segment(segment, waits));
+            match crate::list::start(l) {
+                crate::list::Submission::Run(segments, lease) => {
+                    // The lease finishes with the list's last host list.
+                    let last = segments.len() - 1;
+                    for (k, segment) in segments.into_iter().enumerate() {
+                        let waits = segment.waits();
+                        let lease = (k == last).then(|| lease.clone());
+                        held.push(this as usize, Item::Segment(Segment(segment, lease), waits));
+                    }
+                }
+                crate::list::Submission::Lost => skipped += 1,
+                crate::list::Submission::None => {}
+            }
+        }
+        if skipped > 0 {
+            static LOST: AtomicBool = AtomicBool::new(false);
+            if !LOST.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    skipped,
+                    "lists submitted again after their dynamic descriptor slots were taken back are not run"
+                );
             }
         }
         account().submissions += 1;
@@ -152,9 +171,18 @@ pub(crate) enum Why {
 #[cfg(windows)]
 use crate::hold::Item;
 
+/// A held host list of a title list and, on the list's last one, the
+/// list's dynamic-slot lease, finished once it has run
+/// (`crate::descriptor::lease`).
+#[cfg(windows)]
+pub(crate) struct Segment(
+    std::sync::Arc<crate::host::HostList>,
+    Option<std::sync::Arc<crate::descriptor::lease::Lease>>,
+);
+
 /// Every queue's held work.
 #[cfg(windows)]
-type Holding = crate::hold::Held<std::sync::Arc<crate::host::HostList>>;
+type Holding = crate::hold::Held<Segment>;
 
 #[cfg(windows)]
 static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(crate::hold::Held::new());
@@ -204,13 +232,18 @@ fn pump(held: &mut Holding, why: Why) {
     let fence = |f: usize| crate::fence::value(f as This);
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
-    let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
+    let mut run = |_: usize, segments: Vec<Segment>| {
+        let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &*s.0).collect();
         let at = std::time::Instant::now();
         host.execute(&lists);
         ran += at.elapsed();
         drop(lists);
-        segments.into_iter().for_each(crate::list::recycle);
+        for Segment(list, lease) in segments {
+            if let Some(lease) = lease {
+                lease.finish();
+            }
+            crate::list::recycle(list);
+        }
     };
     let mut signal = |f: usize, value: u64| {
         crate::fence::set(f as This, value);

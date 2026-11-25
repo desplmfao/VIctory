@@ -140,6 +140,49 @@ pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// What [`start`] finds for a list about to be submitted.
+#[cfg(windows)]
+pub(crate) enum Submission {
+    /// Its host lists ([`segments`]) to run; finish the lease once the last
+    /// of them has run.
+    Run(
+        Vec<std::sync::Arc<crate::host::HostList>>,
+        std::sync::Arc<crate::descriptor::lease::Lease>,
+    ),
+    /// The list lost its dynamic slots after an earlier submission; skip it.
+    Lost,
+    /// Null or without a host list; nothing to submit.
+    None,
+}
+
+/// Before a list is submitted: takes its host lists and locks its current
+/// dynamic-slot lease against reclamation until the caller finishes it
+/// (see [`crate::descriptor::lease`]). Capturing the lease here means the
+/// caller never reads the list again after submission, even if another
+/// thread resets or releases it on a bottom-of-pipe write (the queue may
+/// hold the host lists past that, `crate::hold`).
+#[cfg(windows)]
+pub(crate) fn start(this: This) -> Submission {
+    let segments = segments(this);
+    if segments.is_empty() {
+        return Submission::None;
+    }
+    let lease = {
+        // SAFETY: `segments` checked non-null; the title passes one of our lists.
+        let state = unsafe { &(*this.cast::<List>()).state };
+        state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lease()
+            .clone()
+    };
+    if lease.start() {
+        Submission::Run(segments, lease)
+    } else {
+        Submission::Lost
+    }
+}
+
 /// The host list a title list's calls record into (its current segment),
 /// if there is a host GPU.
 #[cfg(windows)]
@@ -2030,5 +2073,61 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finishing_a_started_submission_does_not_reclaim_a_reset_lists_new_slots() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let release_obj = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        if host_list(list).is_none() {
+            assert_eq!(release_obj(list), 0);
+            assert_eq!(release_obj(allocator), 0);
+            return; // no host GPU
+        }
+        let heap = 0x1000_0006;
+        with_state(list, |_, s| s.lease().add(heap, 10, 4));
+        assert_eq!(close(list), S_OK);
+        let Submission::Run(_, first_lease) = start(list) else {
+            panic!("list with host list should start");
+        };
+        // Concurrent reset after bottom-of-pipe writes replaces `State`'s lease
+        // and records new unsubmitted slots on the reset list.
+        assert_eq!(reset(list, allocator, null), S_OK);
+        with_state(list, |_, s| s.lease().add(heap, 20, 4));
+        first_lease.finish();
+        assert!(
+            !crate::descriptor::lease::reclaim(heap, |_| {
+                panic!("unsubmitted slots of the reset list must not be reclaimed")
+            })
+        );
+        with_state(list, |_, s| {
+            assert!(!s.lease().is_lost());
+            assert_eq!(s.lease().take(), [(heap, 20, 4)]);
+        });
+        // Concurrent release after `start` drops the list before `finish`.
+        with_state(list, |_, s| s.lease().add(heap, 30, 2));
+        assert_eq!(close(list), S_OK);
+        let Submission::Run(_, released_lease) = start(list) else {
+            panic!("list with host list should start");
+        };
+        assert_eq!(release_obj(list), 0);
+        assert_eq!(release_obj(allocator), 0);
+        released_lease.finish();
+        assert!(
+            !crate::descriptor::lease::reclaim(heap, |_| {
+                panic!("released list dropped its slots")
+            })
+        );
     }
 }
