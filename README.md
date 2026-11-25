@@ -8,23 +8,70 @@ the platform underneath it and converts the title's data, ahead of time where
 it can (shaders and pipelines too, see Getting started) and on first use
 otherwise. See [docs/architecture.md](docs/architecture.md).
 
-## This fork: the PRs we run (Linux, NVIDIA)
+## This branch (`renderer`): the fork's `main` plus the rendering work
 
-This fork's `main` is upstream `main` plus a stack of open pull requests that we
+The fork's `main` is upstream `main` plus small fixes (open pull requests) that we
 test together on Linux (CachyOS, proton-cachyos 11.0 with Proton Experimental's
 vkd3d-proton 3.2.0, RTX 5080 16 GB, 60 GB RAM). Upstream only takes pull
-requests from collaborators now, so this branch keeps track of what we use.
-Clone it and build as described below. The previous stack (built on #185) is
-kept as the branch `main-2026-11-24`.
+requests from collaborators now, so the fork keeps track of what we use.
+This `renderer` branch adds the rendering work on top: #439 and the rendering
+pull requests, our fix for vkd3d-proton, and two diagnostics tools. It is
+what draws the world (below); `main` stays the smaller, steadier stack.
 
-Upstream base: Marvisak/VIctory `main` at `940d32f`.
+Upstream base: Marvisak/VIctory `main` at `67e8ae1`.
 
-**Rendering work is on the [`renderer`](https://github.com/desplmfao/VIctory/tree/renderer)
-branch** (this `main` plus #439, the rendering pull requests and our fixes).
-There the world is drawn on NVIDIA under Linux, without the GPU timeouts.
-Its README has the settings that takes, including Microsoft's
-`d3dcompiler_47.dll`: without it, Wine's compiler makes VIctory drop every
-indirect draw.
+### State (2026-11-25): the world is drawn on NVIDIA under Linux
+
+With this stack and the settings below, the first mission's prison yard is
+drawn (buildings, the watchtower, people, fog against the sun) and runs
+without the GPU timeouts that froze every earlier run. What it took:
+
+1. **Microsoft's `d3dcompiler_47.dll`.** Wine's builtin compiler refuses
+   VIctory's run-time helper shaders, and then every indirect draw and
+   dispatch is dropped (`no argument clamp: indirect execution dropped` in
+   the log): most of the world was never drawn. See
+   [#2082](https://github.com/Marvisak/VIctory/pull/2082).
+2. **#439 (wave64 on 32-lane GPUs)**, with our fix for vkd3d-proton: NVIDIA
+   runs only 32-lane waves; without #439 the title's 64-lane compute hangs
+   the GPU. #439's form of some loops made vkd3d-proton's dxil-spirv recurse
+   until the process died; the fix (one back edge per block) is below.
+3. **Skip four compute shaders** for now. Three are Microsoft's
+   `XboxBvhBuilder.dll` passes that unpack the world's ray-tracing structures
+   (`Box32Rehydration`, `Box16Rehydration`, `DecompressHeader`): at the
+   world load they arrive as one submission of about 7,000 dispatches that
+   the GPU takes longer than the driver allows (NVIDIA Xid 109, then the
+   title's own watchdog). The fourth is the hair pass `CSGenerateHairVB`.
+   Found with the GPU breadcrumbs below. Skipping them leaves hair and
+   ray-traced lighting out.
+
+Known problems: anything in shadow is black and characters are silhouettes
+(ray-traced lighting does not run), white sawtooth artifacts on some edges,
+1–2 s per frame. About 26 GB of RAM and 12–13 GB of video memory in the world.
+
+Run (diagnostics build: the skip list works only there):
+
+```sh
+cargo build --profile diag -p victory --features diagnostics --target x86_64-pc-windows-msvc
+# next to victory.exe: vkd3d-proton's d3d12.dll, d3d12core.dll and Microsoft's d3dcompiler_47.dll
+WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,d3dcompiler_47=n,b" \
+VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains \
+VICTORY_PIPELINE_JOURNAL=1 \
+VICTORY_LEVELS_ON_DEMAND=1 \
+proton runinprefix victory.exe run <game exe> --execute --console series-x
+```
+
+With #2167, #2118 and #2311 in this branch, no pipelines need skipping.
+#2167 lets Microsoft's BVH rehydration passes finish in time. #2118 holds
+the BVH builder back while any of its pipelines is missing; on NVIDIA five
+are refused, so it stays held back and ray-traced lighting does not run. A
+half-run builder wrote garbage into title memory: headless characters,
+triangles across the screen, and a title crash. #2311 keeps the passes that
+walk the BVH from running over an unbuilt one. Raw access chains off (above)
+lets the hair passes run; hair is not visible yet.
+
+Optional: set `<motionBlur value="false" />` in the title's
+`storage/settings/settings.xml` (in the data folder); the picture is far
+easier to read at 1–2 fps.
 
 | PR | Author | What it does |
 |----|--------|--------------|
@@ -37,25 +84,31 @@ indirect draw.
 | [#2099](https://github.com/Marvisak/VIctory/pull/2099) | 0xkn0wh3r3 | The descriptor view table stops growing (about 200 MB more RAM every 30 s in the world without it) |
 | [#2071](https://github.com/Marvisak/VIctory/pull/2071) | 0xkn0wh3r3 | Frees the executable's bytes once loaded (228 MB) |
 | [#2088](https://github.com/Marvisak/VIctory/pull/2088) | kxiserino ([#402](https://github.com/Marvisak/VIctory/pull/402)), desplmfao | Reuses loose windows that hold a range; 256 KiB windows instead of 4 MiB |
+| [#2112](https://github.com/Marvisak/VIctory/pull/2112) | desplmfao | Opt-in (`VICTORY_IN_PLACE=1`): title memory read in place instead of copied; on vkd3d-proton only allocations already 90% resident (opening one pins all of it) |
 | [#2162](https://github.com/Marvisak/VIctory/pull/2162) | desplmfao | Depth twins share their scratch buffers (about 280 MB video memory) |
 | [#2389](https://github.com/Marvisak/VIctory/pull/2389) | desplmfao (fxceless's mechanism, 507KAZ's tip) | Opt-in `VICTORY_LEVELS_ON_DEMAND=1`: streamed textures take video memory only for the levels the title holds (about 5 GB less) |
 | [#2218](https://github.com/Marvisak/VIctory/pull/2218) | desplmfao (from youroot-code's fxceless/victory-fork#23) | GameInput keeps 256 readings per device, not 32 (input read through the history is not lost at low frame rates) |
+| [#439](https://github.com/Marvisak/VIctory/pull/439) (with #233, #320) | r4tedx | Wave64 compute on 32-lane GPUs (NVIDIA): one console wave runs in the console flow |
+| [#2309](https://github.com/Marvisak/VIctory/pull/2309) | powplusplus ([#1885](https://github.com/Marvisak/VIctory/pull/1885), one commit), desplmfao | One back edge per loop header and per block, so vkd3d-proton's dxil-spirv converts #439's loops instead of recursing until the process dies |
+| [#1722](https://github.com/Marvisak/VIctory/pull/1722) | Impre-visible | The host pipeline library works under Wine |
+| [#1769](https://github.com/Marvisak/VIctory/pull/1769) | Impre-visible | LDS accesses outside the program's allocation read 0 |
+| [#1763](https://github.com/Marvisak/VIctory/pull/1763) | n-romanovich | Refuse typed UAVs in unsupported formats |
+| [#1751](https://github.com/Marvisak/VIctory/pull/1751) | JurajSimicevic | Capped view heaps keep the full dynamic range (NVIDIA) |
+| [#1906](https://github.com/Marvisak/VIctory/pull/1906) | Slay326 | View addresses for tables made afresh |
+| [#688](https://github.com/Marvisak/VIctory/pull/688) | iurysf | Take back dynamic descriptor slots when a heap runs short |
+| [#1872](https://github.com/Marvisak/VIctory/pull/1872) | BastienRodz | The depth twin's converter builds its root signature under Wine |
+| [#158](https://github.com/Marvisak/VIctory/pull/158) | r4tedx | The depth bounds test reaches the host |
+| [#2292](https://github.com/Marvisak/VIctory/pull/2292) (draft) | desplmfao | Opt-in `VICTORY_PIPELINE_SOFT_CRASH=1`: a pipeline whose creation faults is refused and the title goes on |
+| [#2167](https://github.com/Marvisak/VIctory/pull/2167) | RVZO6 | Writes through title memory test the written-pages bit before the atomic OR: Microsoft's BVH rehydration passes no longer take the GPU past the driver's timeout |
+| [#2118](https://github.com/Marvisak/VIctory/pull/2118) | 0xkn0wh3r3 | The BVH builder runs whole or not at all (a half-run builder wrote garbage into title memory) |
+| [#2311](https://github.com/Marvisak/VIctory/pull/2311) | Bullet18x | Programs that walk the BVH wait until the builder has run whole |
+| [#2310](https://github.com/Marvisak/VIctory/pull/2310) | desplmfao | Diagnostics, `VICTORY_GPU_BREADCRUMBS=1`: when a submission runs too long or the device is lost, names the draw or dispatch the GPU is in |
+| [#1152](https://github.com/Marvisak/VIctory/pull/1152) | pablogonz12 | No blending on integer render targets: the room's wall mesh pipeline is made instead of refused (walls no longer vanish now and then) |
 
 Running under Proton is much faster with the wineserver patch from
 [#340](https://github.com/Marvisak/VIctory/issues/340); see
 [#2082](https://github.com/Marvisak/VIctory/pull/2082) for how to build it
 (about 4 s to 1 s per world frame here).
-
-State of this stack (2026-11-25): boots and reaches the world (about 2,000
-draws per frame, 430–550 ms per frame). In the world the game process uses
-about 14–16 GB of RAM (VIctory's own heap about 1.4 GB, flat) and about
-12 GB of video memory, of which about 9 GB are textures and about 2 GB are
-inside the NVIDIA driver. Known problems: most of the world is not drawn yet,
-because NVIDIA refuses the title's wave64 compute shaders (r4tedx's
-[#233](https://github.com/Marvisak/VIctory/pull/233) stack works on it), and
-in about one run in three the GPU hangs at the start of the first mission
-(`Unsignaled CrossQueueBarrier` in the title's crash log, NVIDIA Xid 109;
-see [#1323](https://github.com/Marvisak/VIctory/issues/1323)).
 
 ## Status (2026-11-24)
 
