@@ -37,8 +37,8 @@ indirect draw.
 | [#2099](https://github.com/Marvisak/VIctory/pull/2099) | 0xkn0wh3r3 | The descriptor view table stops growing (about 200 MB more RAM every 30 s in the world without it) |
 | [#2071](https://github.com/Marvisak/VIctory/pull/2071) | 0xkn0wh3r3 | Frees the executable's bytes once loaded (228 MB) |
 | [#2088](https://github.com/Marvisak/VIctory/pull/2088) | kxiserino ([#402](https://github.com/Marvisak/VIctory/pull/402)), desplmfao | Reuses loose windows that hold a range; 256 KiB windows instead of 4 MiB |
-| [#2112](https://github.com/Marvisak/VIctory/pull/2112) | desplmfao | Opt-in (`VICTORY_IN_PLACE=1`): title memory read in place instead of copied; on vkd3d-proton only allocations already 90% resident (opening one pins all of it) |
 | [#2162](https://github.com/Marvisak/VIctory/pull/2162) | desplmfao | Depth twins share their scratch buffers (about 280 MB video memory) |
+| [#2389](https://github.com/Marvisak/VIctory/pull/2389) | desplmfao (fxceless's mechanism, 507KAZ's tip) | Opt-in `VICTORY_LEVELS_ON_DEMAND=1`: streamed textures take video memory only for the levels the title holds (about 5 GB less) |
 | [#2218](https://github.com/Marvisak/VIctory/pull/2218) | desplmfao (from youroot-code's fxceless/victory-fork#23) | GameInput keeps 256 readings per device, not 32 (input read through the history is not lost at low frame rates) |
 
 Running under Proton is much faster with the wineserver patch from
@@ -157,18 +157,6 @@ limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
-Set `VICTORY_IN_PLACE=1` (experimental) to let the host GPU read title
-memory in place instead of from host copies (title buffers and memory
-outside them), which saves the copies' host memory and their refreshes.
-Where the host opens part of an allocation as a heap
-(`OpenExistingHeapFromAddress1`), only a buffer's own pages are opened.
-Elsewhere (vkd3d-proton) the whole allocation is opened, which makes all of
-it resident, so only allocations already mostly in memory go in place: 90%
-by default, `VICTORY_IN_PLACE_DENSITY` sets the percentage. Sparse
-allocations, and memory that is not one committed allocation (a buffer over
-many separately mapped pages, say), are still copied. Unset, nothing
-changes.
-
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 
@@ -197,19 +185,6 @@ victory config
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
-
-Host drivers that crash compiling a shader: with `VICTORY_PIPELINE_JOURNAL=1`
-a pipeline whose creation ends the process is refused from the next run on
-(its draws dropped, as for any refused pipeline) and listed in
-`pipeline-journal\crashed.txt` under the cache folder. Each such pipeline
-costs one crash; delete its line to try it again. Pipelines are still created
-in parallel; when a crash leaves several in creation, they are listed in
-`pipeline-journal\suspects.txt` and each is created alone until it succeeds,
-so a repeat crash names only the pipeline that caused it. Notes of a process
-that is still running (a second instance) are left alone. Quitting while a
-single pipeline is being created looks like a crash to the next run: delete
-that pipeline's line from `crashed.txt` (the comment above it names its
-stages) to have it tried again.
 
 ### Windows shader-test validator
 
@@ -246,6 +221,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_PIPELINE_JOURNAL=1` | a pipeline whose creation crashed the process is refused from the next run on, until the translator changes (`pipeline-journal\crashed.txt` in the cache folder; delete a line to retry it; quitting mid-creation counts as a crash) |
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
@@ -258,7 +234,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
-| `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500) |
+| `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
 | `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |

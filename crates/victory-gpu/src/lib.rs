@@ -32,6 +32,7 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+mod hold;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -41,6 +42,8 @@ pub mod list;
 mod memory;
 pub mod object;
 pub mod pipeline;
+#[cfg(windows)]
+mod placement;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
@@ -60,10 +63,14 @@ mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod tiles;
+#[cfg(windows)]
 mod twin;
 #[cfg(windows)]
 mod watch;
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]

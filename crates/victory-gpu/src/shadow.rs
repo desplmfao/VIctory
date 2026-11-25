@@ -47,10 +47,11 @@ pub(crate) struct Shadow {
     /// 64 KiB title page it touches (tracked memory only): writes through
     /// views of it are marked there ([`Shadow::mark_entry`]).
     marks: Option<u32>,
-    /// The host buffer is the title memory itself (`VICTORY_IN_PLACE`): a
-    /// buffer placed in a heap opened over the title's allocation, so there
-    /// is nothing to copy either way.
-    in_place: bool,
+    /// Where it starts in `buffer` (0 but for copies sharing a buffer), and
+    /// the run of the shared buffer it holds ([`Arena`]), given back when it
+    /// goes.
+    base: u64,
+    slice: Option<Slice>,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -162,7 +163,7 @@ impl Shadow {
 
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        address - self.start
+        address - self.start + self.base
     }
 
     /// Where the title memory it copies starts, and its length.
@@ -181,9 +182,6 @@ impl Shadow {
     // shortcut: a page the copy holds only in part (at its ends) has no
     // "copied" mark and is compared without the title-write check.
     pub(crate) fn copy_back_page(&self, page: usize) -> usize {
-        if self.in_place {
-            return 0;
-        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
@@ -222,19 +220,18 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
-        if self.in_place {
-            return;
-        }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
-        Self::new_with(buffer, data, gpu, start, len, false)
+        Shadow::new_at(buffer, data, gpu, start, len, None)
     }
 
-    fn new_with(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, in_place: bool) -> Arc<Shadow> {
-        let tracked = if in_place { None } else { crate::watch::track(start as usize, len as usize, true) };
+    /// [`Shadow::new`] of a copy in a run of a shared buffer (`data` and
+    /// `gpu` are the run's).
+    fn new_at(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, slice: Option<Slice>) -> Arc<Shadow> {
+        let tracked = crate::watch::track_copy(start as usize, len as usize, true);
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
             buffer,
@@ -246,7 +243,8 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             marks,
-            in_place,
+            base: slice.map_or(0, |s| s.offset),
+            slice,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -291,9 +289,6 @@ impl Shadow {
     /// views (`victory_shader::emit`, "Write marks"): no snapshot then, only
     /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
-        if self.in_place {
-            return;
-        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
     }
@@ -310,9 +305,6 @@ impl Shadow {
     /// a title write there before the copy-back keeps the page's bytes from
     /// before it ([`crate::watch::Tracked::arm`]).
     pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
-        if self.in_place {
-            return;
-        }
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -367,9 +359,6 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        if self.in_place {
-            return 0;
-        }
         self.copy_back_or_not(address, len, true)
     }
 
@@ -377,9 +366,6 @@ impl Shadow {
     /// in the copy and does not go into title memory (they computed it
     /// from memory with no copy, `crate::memory`).
     pub(crate) fn keep_writes(&self, address: usize, len: usize) {
-        if self.in_place {
-            return;
-        }
         self.copy_back_or_not(address, len, false);
     }
 
@@ -475,9 +461,6 @@ impl Shadow {
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
     pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
-        if self.in_place {
-            return 0;
-        }
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -529,11 +512,23 @@ impl Shadow {
         written.map_or(0, |_| n)
     }
 
+    /// Whether the title wrote none of the copy's memory since the copy took
+    /// it (tracked memory only): [`Shadow::update`] would copy nothing.
+    pub(crate) fn clean(&self) -> bool {
+        self.tracked.as_ref().is_some_and(crate::watch::Tracked::clean)
+    }
+
+    /// Its tracker's bit: `crate::watch::clean_bit` of it is
+    /// [`Shadow::clean`] (none for memory that is not tracked: never clean).
+    pub(crate) fn dirty_bit(&self) -> Option<u32> {
+        self.tracked.as_ref().and_then(crate::watch::Tracked::bit)
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
-        if self.in_place {
+        if self.clean() {
             return 0;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -616,11 +611,29 @@ impl Shadow {
         if let Some(t) = &self.tracked {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            let runs = t.take(from, to);
+            let (runs, unmapped) = t.take_split(from, to);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
             // Cut to the range: next to it shaders may be writing the copy.
-            let copied: usize = runs.into_iter().map(|(a, b)| self.copy(a, b)).sum();
+            let mut copied: usize = runs.into_iter().map(|(a, b)| self.copy(a, b)).sum();
+            for (a, b) in unmapped {
+                // SAFETY: inside the mapping (`take_split` cuts to the buffer).
+                unsafe { self.data.add(a - self.start as usize).write_bytes(0, b - a) };
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
+            }
+            // Parts on memory that is not the runtime's: whole, as below.
+            for (a, b) in t.untracked(from, to) {
+                #[cfg(feature = "diagnostics")]
+                let started = std::time::Instant::now();
+                copied += self.copy(a, b);
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::WholeBytes, (b - a) as u64);
+                    add(C::WholeUs, started.elapsed().as_micros() as u64);
+                }
+            }
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -655,6 +668,9 @@ impl Shadow {
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if let Some(slice) = self.slice {
+            arena().give_back(slice);
+        }
         if let Some(base) = self.marks {
             let mut m = marks();
             m.owners.remove(&base);
@@ -740,13 +756,18 @@ unsafe impl Send for Bitmap {}
 // SAFETY: as above.
 unsafe impl Sync for Bitmap {}
 
-fn bitmap() -> Option<&'static Bitmap> {
-    static BITMAP: std::sync::OnceLock<Option<Bitmap>> = std::sync::OnceLock::new();
-    BITMAP
+/// The bitmap of other shaders, or (`memory`) of shaders that use title
+/// memory, whose marks go back only while it is not withheld
+/// (`crate::memory::withholding`).
+fn bitmap(memory: bool) -> Option<&'static Bitmap> {
+    static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] = [const { std::sync::OnceLock::new() }; 2];
+    BITMAPS[usize::from(memory)]
         .get_or_init(|| {
-            let bytes = u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8);
+            // Written pages, then one read mark per heap index.
+            let bits = victory_shader::emit::VIEW_READS + victory_shader::emit::HEAP_VIEWS;
+            let bytes = u64::from(bits / 8);
             let (buffer, data) = host()?.shared_buffer(bytes)?;
-            crate::host::name(&buffer, || "views' written pages".into());
+            crate::host::name(&buffer, || "views' written pages and read slots".into());
             // SAFETY: our mapped buffer of `bytes` bytes.
             unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
             // SAFETY: a live buffer.
@@ -761,38 +782,136 @@ fn bitmap() -> Option<&'static Bitmap> {
 }
 
 /// The host GPU address of the buffer views' written-pages bitmap, for the
-/// root UAV of shaders that mark their writes.
-pub(crate) fn view_writes() -> Option<u64> {
-    bitmap().map(|b| b.gpu)
+/// root UAV of shaders that mark their writes (`memory`: shaders that use
+/// title memory, see [`bitmap`]).
+pub(crate) fn view_writes(memory: bool) -> Option<u64> {
+    bitmap(memory).map(|b| b.gpu)
+}
+
+/// Heap slots whose texture views shaders read: the marks seen so far (a
+/// slot's stays set in the bitmap until [`forget_read`]), and the slots to
+/// clear at the next [`take_reads`].
+static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()));
+
+/// After a submission: the heap slots its shaders first read texture views
+/// at (`victory_shader::emit`, "Read marks"), each once until
+/// [`forget_read`]. Clears the slots forgotten since first.
+pub(crate) fn take_reads() -> Vec<u32> {
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let first = (victory_shader::emit::VIEW_READS / 32) as usize;
+    // Both bitmaps: shaders that use title memory mark their reads in theirs.
+    let mut maps: Vec<&mut [u32]> = [false, true]
+        .into_iter()
+        .filter_map(bitmap)
+        // SAFETY: the mapped bitmap's read marks; the GPU is done with them
+        // (one submission runs at a time).
+        .map(|b| unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) })
+        .collect();
+    if maps.is_empty() {
+        return Vec::new();
+    }
+    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+    let (seen, forgotten) = &mut *reads;
+    seen.resize(words, 0);
+    for slot in forgotten.drain(..) {
+        let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
+        if w < words {
+            maps.iter_mut().for_each(|bits| bits[w] &= !bit);
+            seen[w] &= !bit;
+        }
+    }
+    let mut new = Vec::new();
+    for (w, s) in seen.iter_mut().enumerate() {
+        let mut fresh = maps.iter().fold(0, |x, bits| x | bits[w]) & !*s;
+        *s |= fresh;
+        while fresh != 0 {
+            new.push(w as u32 * 32 + fresh.trailing_zeros());
+            fresh &= fresh - 1;
+        }
+    }
+    new
+}
+
+/// The heap slots shaders read texture views at since the last call (both
+/// bitmaps), whose marks are cleared: what the title used (eviction stamps,
+/// `crate::resource::evict`). Between submissions, after [`take_reads`]
+/// has seen every mark: its own record of slots seen keeps a slot read
+/// again from being reported as new.
+pub(crate) fn reads_since() -> Vec<u32> {
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let first = (victory_shader::emit::VIEW_READS / 32) as usize;
+    let mut slots = Vec::new();
+    for b in [false, true].into_iter().filter_map(bitmap) {
+        // SAFETY: the mapped bitmap's read marks; no submission runs.
+        let bits = unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
+        for (w, word) in bits.iter_mut().enumerate() {
+            let mut x = std::mem::take(word);
+            while x != 0 {
+                slots.push(w as u32 * 32 + x.trailing_zeros());
+                x &= x - 1;
+            }
+        }
+    }
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+}
+
+/// Heap slot `slot` now holds a texture view left null: its next read is
+/// marked again.
+pub(crate) fn forget_read(slot: u32) {
+    READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
 }
 
 /// After a submission: every page its shaders marked as written through
 /// views goes back ([`Shadow::copy_back_marked`]), but for pages in
 /// `withheld` (ranges of copies that lists whose writes stay out of title
-/// memory declared); the bitmap is cleared. Before the copy-backs of
+/// memory declared) and, with `memory_withheld`, pages that shaders using
+/// title memory marked; the bitmaps are cleared. Before the copy-backs of
 /// declared ranges, which disarm the copies.
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
-pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
-    let Some(b) = bitmap() else {
-        return;
-    };
+pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
+    let (mut marked, mut held) = (Vec::new(), Vec::new());
+    for memory in [false, true] {
+        let Some(b) = bitmap(memory) else {
+            continue;
+        };
+        let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
+        // SAFETY: the mapped bitmap; the GPU is done with it (one submission
+        // runs at a time).
+        let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
+        // Marks of offsets past the bitmap land in its last bit, no copy's.
+        bits[words - 1] = 0;
+        let used = (marks().end as usize).div_ceil(32).min(words);
+        for (w, word) in bits[..used].iter_mut().enumerate() {
+            let mut x = std::mem::take(word);
+            let into = if memory && memory_withheld { &mut held } else { &mut marked };
+            while x != 0 {
+                into.push((w * 32) as u32 + x.trailing_zeros());
+                x &= x - 1;
+            }
+        }
+    }
     #[cfg(feature = "diagnostics")]
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
-    let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
-    // SAFETY: the mapped bitmap; the GPU is done with it (one submission
-    // runs at a time).
-    let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
-    // Marks of offsets past the bitmap land in its last bit, no copy's.
-    bits[words - 1] = 0;
-    let mut marked = Vec::new();
-    let used = (marks().end as usize).div_ceil(32).min(words);
-    for (w, word) in bits[..used].iter_mut().enumerate() {
-        let mut x = std::mem::take(word);
-        while x != 0 {
-            marked.push((w * 32) as u32 + x.trailing_zeros());
-            x &= x - 1;
+    marked.sort_unstable();
+    marked.dedup();
+    let page_of = |m: &Marks, n: u32| {
+        let (&base, copy) = m.owners.range(..=n).next_back()?;
+        let copy = copy.upgrade()?;
+        let k = n - base;
+        (k < pages(copy.start, copy.len)).then(|| {
+            let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
+            (copy, page)
+        })
+    };
+    // Held back: dropped from the copies (`crate::memory::drop_withheld`).
+    if !held.is_empty() {
+        let m = marks();
+        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+            crate::memory::drop_withheld(page, PAGE);
         }
     }
     if marked.is_empty() {
@@ -800,18 +919,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
     }
     let pages: Vec<(Arc<Shadow>, usize)> = {
         let m = marks();
-        marked
-            .iter()
-            .filter_map(|&n| {
-                let (&base, copy) = m.owners.range(..=n).next_back()?;
-                let copy = copy.upgrade()?;
-                let k = n - base;
-                (k < pages(copy.start, copy.len)).then(|| {
-                    let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
-                    (copy, page)
-                })
-            })
-            .collect()
+        marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
     for (copy, page) in pages {
         if withheld
@@ -908,25 +1016,6 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return loose(address, end);
     };
     let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() && in_place_enabled() {
-        // In place: from the 64 KiB boundary at or below the buffer (views
-        // find their bytes by address, `Shadow::offset`), past its end by the
-        // 256 bytes a view ending in its last bytes reads where the
-        // allocation has them, else to its end.
-        const G: u64 = 64 << 10;
-        let lo = key.0 / G * G;
-        let part = [entry.end + 256, entry.end].into_iter().find_map(|end| {
-            let hi = end.next_multiple_of(G);
-            committed_part(lo, hi - lo, key.0, end)
-        });
-        if let Some((s0, l0)) = part
-            && let Some((buffer, gpu)) = in_place_buffer(s0, l0)
-        {
-            crate::host::name(&buffer, || format!("title buffer in place {:#x}+{:#x}", key.0, entry.end - key.0));
-            entry.shadow = Some(Shadow::new_with(buffer, s0 as *mut u8, gpu, s0, l0, true));
-            changed();
-        }
-    }
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -952,371 +1041,6 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         changed();
     }
     entry.shadow.clone()
-}
-
-/// `VICTORY_IN_PLACE=1` (experimental, #880): title buffers and loose
-/// windows are the title's memory itself, opened as a host heap, instead of
-/// copies.
-fn in_place_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_IN_PLACE").is_some_and(|v| v == "1"))
-}
-
-
-/// A heap opened over a title allocation and its size; `None` if it could
-/// not be opened.
-type OpenedHeap = Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>;
-
-/// Host heaps opened over title allocations, by allocation base.
-static IN_PLACE_HEAPS: Mutex<Option<std::collections::HashMap<usize, OpenedHeap>>> = Mutex::new(None);
-
-/// The size of the allocation starting at `base` if all of it is still
-/// committed memory of that allocation, else `None`.
-fn allocation_extent(base: usize) -> Option<u64> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    let mut at = base;
-    loop {
-        // SAFETY: plain data, filled by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0
-            || info.AllocationBase as usize != base
-        {
-            return (at > base).then(|| (at - base) as u64);
-        }
-        if info.State != MEM_COMMIT {
-            return None;
-        }
-        at = info.BaseAddress as usize + info.RegionSize;
-    }
-}
-
-/// The share of an allocation's pages that must already be in memory
-/// before it is opened as a heap (percent; `VICTORY_IN_PLACE_DENSITY`).
-fn density_wanted() -> u64 {
-    static WANTED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *WANTED.get_or_init(|| {
-        std::env::var("VICTORY_IN_PLACE_DENSITY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(90)
-            .min(100)
-    })
-}
-
-/// Density decisions by allocation (base and size: an allocation made
-/// again at the same address is a new one), and when they were made.
-type Decided = std::collections::HashMap<(usize, u64), (bool, std::time::Instant)>;
-static DECIDED: Mutex<Option<Decided>> = Mutex::new(None);
-
-/// Whether most of the allocation at `base` (`size` bytes) is already in
-/// memory. Opening a heap over an allocation makes all of it resident:
-/// importing it as host memory pins every page, also committed pages the
-/// title never touched, which cost nothing until then (Grand Theft Auto VI
-/// on Linux: 1.9 GB more anonymous memory against 1.4 GB fewer copies, so
-/// in place cost more than the copies it replaced). A sparse allocation
-/// keeps its copies. Asked again after 10 s, as the title fills its
-/// allocations.
-fn dense(base: usize, size: Option<u64>) -> bool {
-    use windows_sys::Win32::System::ProcessStatus::{
-        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let Some(size) = size else { return false };
-    if let Some(&(dense, when)) = DECIDED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .and_then(|d| d.get(&(base, size)))
-        && when.elapsed() < std::time::Duration::from_secs(10)
-    {
-        return dense;
-    }
-    // At most 64Ki pages asked, evenly spread over the allocation.
-    let pages = (size / 4096).max(1);
-    let step = pages.div_ceil(1 << 16);
-    let mut asked: Vec<PSAPI_WORKING_SET_EX_INFORMATION> = (0..pages.div_ceil(step))
-        .map(|i| PSAPI_WORKING_SET_EX_INFORMATION {
-            VirtualAddress: (base as u64 + i * step * 4096) as *mut _,
-            ..Default::default()
-        })
-        .collect();
-    // SAFETY: our own process and an array of the size given.
-    let ok = unsafe {
-        K32QueryWorkingSetEx(
-            GetCurrentProcess(),
-            asked.as_mut_ptr().cast(),
-            (asked.len() * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
-        )
-    } != 0;
-    // SAFETY: the union's flags word; bit 0 is "valid" (in memory).
-    let resident = asked
-        .iter()
-        .filter(|a| unsafe { a.VirtualAttributes.Flags } & 1 != 0)
-        .count() as u64;
-    let dense = ok && resident * 100 >= asked.len() as u64 * density_wanted();
-    tracing::debug!(
-        base = format_args!("{base:#x}"),
-        size,
-        resident,
-        asked = asked.len(),
-        dense,
-        "title allocation density"
-    );
-    DECIDED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(Default::default)
-        .insert((base, size), (dense, std::time::Instant::now()));
-    dense
-}
-
-/// Once a frame: heaps opened over allocations the title has released or
-/// changed since (another size, or not all committed) are let go with the
-/// in-place windows and title buffers over them, as on a remap. The title
-/// frees some of its memory itself, unseen by us; what this cannot tell is
-/// an allocation released and made again at the same address and size.
-pub(crate) fn check_in_place() {
-    let pending = std::mem::take(&mut *STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()));
-    for (base, size) in pending {
-        let_go_in_place(base as u64, size);
-    }
-    if !in_place_enabled() {
-        return;
-    }
-    let stale: Vec<(usize, u64)> = {
-        let heaps = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        heaps
-            .iter()
-            .flat_map(|h| h.iter())
-            .filter_map(|(&base, v)| v.as_ref().map(|(_, size)| (base, *size)))
-            .filter(|&(base, size)| allocation_extent(base) != Some(size))
-            .collect()
-    };
-    for (base, size) in stale {
-        let_go_in_place(base as u64, size);
-    }
-}
-
-/// Heaps found stale while a caller held `BUFFERS` or `LOOSE`: what is placed
-/// in them is let go at the next frame's check.
-static STALE_IN_PLACE: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
-
-/// Title memory `[at, at + len)` was mapped or unmapped: in-place windows
-/// and title buffers over it, and heaps opened over allocations it touches show the old pages
-/// (pinned while a list still holds them), so lookups get new ones.
-pub(crate) fn in_place_remapped(at: u64, len: u64) {
-    if in_place_enabled() {
-        let_go_in_place(at, len);
-    }
-}
-
-/// Lets go of in-place windows and title buffers over `[at, at + len)` and
-/// heaps opened over allocations it touches.
-fn let_go_in_place(at: u64, len: u64) {
-    let end = at.saturating_add(len);
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    let before = map.len();
-    map.retain(|&(s, l), sh| !(sh.in_place && s < end && at < s + l));
-    let mut gone = before - map.len();
-    drop(map);
-    for e in buffers().values_mut() {
-        if e.shadow.as_ref().is_some_and(|sh| sh.in_place && sh.start < end && at < sh.start + sh.len) {
-            e.shadow = None;
-            gone += 1;
-        }
-    }
-    let mut heaps = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(h) = heaps.as_mut() {
-        h.retain(|&base, v| match v {
-            Some((_, size)) => !((base as u64) < end && at < base as u64 + *size),
-            None => true,
-        });
-    }
-    drop(heaps);
-    if gone > 0 {
-        changed();
-    }
-}
-
-/// The part of window `[start, start + len)` around `[address, end)` that
-/// is committed memory of one allocation, cut to 64 KiB: `None` unless it
-/// holds `[address, end)`.
-fn committed_part(start: u64, len: u64, address: u64, end: u64) -> Option<(u64, u64)> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    const G: u64 = 64 << 10;
-    let query = |at: u64| -> Option<MEMORY_BASIC_INFORMATION> {
-        // SAFETY: plain data, filled by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        (unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } != 0).then_some(info)
-    };
-    let first = query(address)?;
-    if first.State != MEM_COMMIT {
-        return None;
-    }
-    let base = first.AllocationBase as u64;
-    // Down from the region holding `address`, while committed and the same allocation.
-    let mut lo = first.BaseAddress as u64;
-    while lo > start {
-        match query(lo - 1) {
-            Some(i) if i.State == MEM_COMMIT && i.AllocationBase as u64 == base => lo = i.BaseAddress as u64,
-            _ => break,
-        }
-    }
-    let mut hi = first.BaseAddress as u64 + first.RegionSize as u64;
-    while hi < start + len {
-        match query(hi) {
-            Some(i) if i.State == MEM_COMMIT && i.AllocationBase as u64 == base => hi = i.BaseAddress as u64 + i.RegionSize as u64,
-            _ => break,
-        }
-    }
-    // A placed buffer starts at a multiple of 64 KiB; its end only needs to
-    // be committed pages.
-    let lo = lo.max(start).next_multiple_of(G);
-    let hi = (hi.min(start + len)) / 4096 * 4096;
-    (lo <= address && end <= hi).then(|| (lo, hi - lo))
-}
-
-/// A host buffer that is the title memory `[start, start + len)` itself:
-/// placed at its offset in a heap opened over the allocation holding it.
-/// `None` where that cannot be (not one committed allocation, the heap
-/// refused, a placement off 64 KiB).
-fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
-    use windows::Win32::Graphics::Direct3D12::*;
-    use windows::core::Interface;
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    let refuse = |_why: &str| None;
-    // The whole range committed, in one allocation.
-    let mut base = 0usize;
-    let mut at = start as usize;
-    while at < (start + len) as usize {
-        // SAFETY: plain data, filled by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 || info.State != MEM_COMMIT {
-            return refuse("not committed");
-        }
-        let b = info.AllocationBase as usize;
-        if base == 0 {
-            base = b;
-        } else if b != base {
-            return refuse("several allocations");
-        }
-        at = info.BaseAddress as usize + info.RegionSize;
-    }
-    let offset = start - base as u64;
-    if !offset.is_multiple_of(64 << 10) {
-        return refuse("offset");
-    }
-    let host = host()?;
-    // Where the host opens a sub-range, only the buffer's own pages become
-    // a heap: nothing else of the allocation is pinned, and the placed
-    // buffer holds its heap, so the heap goes with the buffer.
-    if !whole_allocations_only()
-        && let Ok(dev13) = host.device.cast::<ID3D12Device13>()
-    {
-        let size = len.next_multiple_of(4096) as usize;
-        // SAFETY: committed pages of one allocation of the title's, from
-        // a 64 KiB boundary of it.
-        let opened = unsafe { dev13.OpenExistingHeapFromAddress1::<ID3D12Heap>(start as *const _, size) };
-        if let Ok(heap) = opened {
-            return place_in(&host.device, &heap, 0, len).or_else(|| refuse("placement refused"));
-        }
-    }
-    // A heap opened earlier over an allocation the title has released or
-    // changed since goes first, with what is placed in it.
-    let extent = allocation_extent(base);
-    let stale = {
-        let heaps = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        heaps
-            .as_ref()
-            .and_then(|h| h.get(&base))
-            .and_then(|v| v.as_ref().map(|(_, size)| *size))
-            .filter(|&size| extent != Some(size))
-    };
-    // Only the heap goes here: the callers hold `BUFFERS` or `LOOSE`, which
-    // letting go of what is placed in it takes, so that waits for the next
-    // frame's check ([`check_in_place`]), outside those locks.
-    let mut heaps = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(size) = stale {
-        if let Some(h) = heaps.as_mut() {
-            h.remove(&base);
-        }
-        STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).push((base, size));
-    }
-    if !heaps.as_ref().is_some_and(|h| h.contains_key(&base)) && !dense(base, extent) {
-        return refuse("sparse");
-    }
-    let heap = heaps.get_or_insert_with(Default::default).entry(base).or_insert_with(|| {
-        let dev3: ID3D12Device3 = host.device.cast().ok()?;
-        // SAFETY: the base of a committed allocation of the title's.
-        let heap: ID3D12Heap = unsafe { dev3.OpenExistingHeapFromAddress(base as *const _) }.ok()?;
-        // SAFETY: a plain query.
-        let size = unsafe { heap.GetDesc() }.SizeInBytes;
-        tracing::debug!(base = format_args!("{base:#x}"), size, "title allocation opened as a host heap");
-        Some((heap, size))
-    });
-    let Some((heap, size)) = heap.clone() else {
-        return refuse("heap refused");
-    };
-    drop(heaps);
-    if offset + len > size {
-        return refuse("past the heap");
-    }
-    place_in(&host.device, &heap, offset, len).or_else(|| refuse("placement refused"))
-}
-
-/// Tests of the whole-allocation path (the heap cache, stale heaps) turn
-/// off sub-range heaps, which a host with `ID3D12Device13` would take.
-#[cfg(test)]
-static WHOLE_ALLOCATIONS_ONLY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-fn whole_allocations_only() -> bool {
-    #[cfg(test)]
-    return WHOLE_ALLOCATIONS_ONLY.load(Ordering::Relaxed);
-    #[cfg(not(test))]
-    false
-}
-
-/// A buffer of `len` bytes placed at `offset` in `heap`, opened over title
-/// memory, and its GPU address.
-fn place_in(
-    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
-    heap: &windows::Win32::Graphics::Direct3D12::ID3D12Heap,
-    offset: u64,
-    len: u64,
-) -> Option<(ID3D12Resource, u64)> {
-    use windows::Win32::Graphics::Direct3D12::*;
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: len,
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        Flags: D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        ..Default::default()
-    };
-    let mut buffer: Option<ID3D12Resource> = None;
-    // SAFETY: a buffer inside the heap.
-    unsafe {
-        device.CreatePlacedResource(
-            heap,
-            offset,
-            &desc,
-            D3D12_RESOURCE_STATE_COMMON,
-            None,
-            &mut buffer,
-        )
-    }
-    .ok()?;
-    let buffer = buffer?;
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    Some((buffer, gpu))
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
@@ -1370,17 +1094,6 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if !crate::texture::committed(address as *const u8, 1) {
         return None;
     }
-    if in_place_enabled()
-        && let Some((s0, l0)) = committed_part(start, len, address, end)
-        && let Some((buffer, gpu)) = in_place_buffer(s0, l0)
-    {
-        crate::host::name(&buffer, || format!("title memory in place {s0:#x}+{l0:#x}"));
-        let shadow = Shadow::new_with(buffer, s0 as *mut u8, gpu, s0, l0, true);
-        LOOSE_SPAN.fetch_max(l0, Ordering::Relaxed);
-        map.insert((s0, l0), shadow.clone());
-        changed();
-        return Some(shadow);
-    }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
@@ -1414,7 +1127,7 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shad
     }
     #[cfg(feature = "diagnostics")]
     VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    exact(address, len).map(|s| (s, true))
+    exact(address, len, element).map(|s| (s, true))
 }
 
 /// Asks for, and copies made of, views off their copy's elements, the
@@ -1434,12 +1147,20 @@ pub(crate) fn log_views(frames: f64) {
         .values()
         .filter(|w| w.strong_count() > 0)
         .count();
+    let (chunks, held) = {
+        let a = arena();
+        // SAFETY: live buffers.
+        let size = |c: &(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)| unsafe { c.0.GetDesc() }.Width;
+        let held: u64 = a.chunks.iter().map(|c| size(c) - c.3.values().sum::<u64>()).sum();
+        (a.chunks.len(), held)
+    };
     if asks > 0 {
         tracing::info!(
-            "buffer views off their copy's elements: {:.0} asked for/frame, {:.0} copies made/frame ({:.1} KB), largest {largest} bytes, {live} live",
+            "buffer views off their copy's elements: {:.0} asked for/frame, {:.0} copies made/frame ({:.1} KB), largest {largest} bytes, {live} live in {chunks} shared buffers ({:.1} MB held)",
             asks as f64 / frames,
             made as f64 / frames,
-            bytes as f64 / frames / 1e3
+            bytes as f64 / frames / 1e3,
+            held as f64 / 1e6
         );
     }
 }
@@ -1451,12 +1172,12 @@ pub(crate) fn log_views(frames: f64) {
 /// new copy of the same bytes took the refreshes). With the size the map
 /// is next pruned of dead entries at.
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(usize, BTreeMap<(u64, u64), std::sync::Weak<Shadow>>)> = Mutex::new((0, BTreeMap::new()));
+static EXACT: Mutex<(usize, BTreeMap<(u64, u64, u64), std::sync::Weak<Shadow>>)> = Mutex::new((0, BTreeMap::new()));
 
-fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+fn exact(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     let (prune_at, map) = &mut *guard;
-    if let Some(shadow) = map.get(&(address, len)).and_then(std::sync::Weak::upgrade) {
+    if let Some(shadow) = map.get(&(address, len, element)).and_then(std::sync::Weak::upgrade) {
         return Some(shadow);
     }
     // Ring positions change every frame: entries die by the hundred.
@@ -1464,12 +1185,10 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         map.retain(|_, w| w.strong_count() > 0);
         *prune_at = (2 * map.len()).max(1024);
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
-    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Shadow::new(buffer, data, gpu, address, len);
-    map.insert((address, len), Arc::downgrade(&shadow));
+    // A run of a shared buffer, its start a whole number of elements in.
+    let (buffer, data, gpu, slice) = arena().take(len, element)?;
+    let shadow = Shadow::new_at(buffer, data, gpu, address, len, Some(slice));
+    map.insert((address, len, element), Arc::downgrade(&shadow));
     #[cfg(feature = "diagnostics")]
     {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1478,6 +1197,98 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         VIEWS[3].fetch_max(len, Relaxed);
     }
     Some(shadow)
+}
+
+/// A run of an [`Arena`] buffer: the buffer, where the run starts, its
+/// bytes.
+#[derive(Clone, Copy)]
+struct Slice {
+    chunk: usize,
+    offset: u64,
+    len: u64,
+}
+
+/// Shared buffers for the copies of single views ([`exact`]): they are
+/// small (~2 KB on average) and come and go by the hundred a frame, and a
+/// buffer of their own each cost a kernel call to make and one to free on
+/// the title's threads and the submitting one (300-820 a frame), and 64 KiB
+/// of memory each (~5,000 live).
+#[derive(Default)]
+struct Arena {
+    /// Each buffer, its mapping and host address, and its free runs
+    /// (offset → bytes).
+    chunks: Vec<(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)>,
+}
+
+/// Bytes of each arena buffer (a larger copy gets one of its size).
+const CHUNK: u64 = 16 << 20;
+
+static ARENA: Mutex<Arena> = Mutex::new(Arena { chunks: Vec::new() });
+
+fn arena() -> std::sync::MutexGuard<'static, Arena> {
+    ARENA.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Arena {
+    /// A run of `len` bytes starting at a multiple of `element` (and of 256)
+    /// in a shared buffer: the buffer, the run's mapping and host address.
+    fn take(&mut self, len: u64, element: u64) -> Option<(ID3D12Resource, *mut u8, u64, Slice)> {
+        let gcd = |mut a: u64, mut b: u64| {
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            a
+        };
+        let align = 256 / gcd(256, element.max(1)) * element.max(1);
+        let len = len.max(1).next_multiple_of(4);
+        let fits = |free: &BTreeMap<u64, u64>| {
+            free.iter().find_map(|(&at, &n)| {
+                let start = at.next_multiple_of(align);
+                (start + len <= at + n).then_some((at, n, start))
+            })
+        };
+        let found = self.chunks.iter().enumerate().find_map(|(c, chunk)| fits(&chunk.3).map(|f| (c, f)));
+        let (chunk, (at, n, start)) = match found {
+            Some(found) => found,
+            None => {
+                let size = CHUNK.max((len + align).next_multiple_of(1 << 16));
+                let (buffer, data) = host()?.shared_buffer(size)?;
+                crate::host::name(&buffer, || format!("title views {size:#x}"));
+                // SAFETY: a live buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                let free = BTreeMap::from([(0, size)]);
+                self.chunks.push((buffer, data as usize, gpu, free));
+                let c = self.chunks.len() - 1;
+                (c, fits(&self.chunks[c].3)?)
+            }
+        };
+        let (buffer, data, gpu, free) = &mut self.chunks[chunk];
+        free.remove(&at);
+        if start > at {
+            free.insert(at, start - at);
+        }
+        if at + n > start + len {
+            free.insert(start + len, at + n - start - len);
+        }
+        let slice = Slice { chunk, offset: start, len };
+        Some((buffer.clone(), (*data + start as usize) as *mut u8, *gpu + start, slice))
+    }
+
+    /// A run goes back, joined to its free neighbours.
+    fn give_back(&mut self, slice: Slice) {
+        let Some((_, _, _, free)) = self.chunks.get_mut(slice.chunk) else { return };
+        let (mut at, mut n) = (slice.offset, slice.len);
+        if let Some((&before, &m)) = free.range(..at).next_back()
+            && before + m == at
+        {
+            free.remove(&before);
+            (at, n) = (before, n + m);
+        }
+        if let Some(m) = free.remove(&(at + n)) {
+            n += m;
+        }
+        free.insert(at, n);
+    }
 }
 
 /// Every host copy of title memory made so far (buffers and windows).
@@ -1520,8 +1331,18 @@ pub(crate) fn near(va: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A shader's read mark of heap slot `slot` in the bitmap of shaders
+    /// that use title memory (`memory`) or of the others.
+    pub(crate) fn mark_read(memory: bool, slot: u32) {
+        let b = bitmap(memory).expect("a host GPU");
+        let bit = victory_shader::emit::VIEW_READS + slot;
+        // SAFETY: a bit of the mapped bitmap; no submission runs (the caller
+        // holds the submission lock).
+        unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+    }
 
     /// The title writes a constant under a range an earlier list of the
     /// submission declared as written by shaders: the refresh before the
@@ -1556,6 +1377,95 @@ mod tests {
             assert_eq!(title(PAGE + 20).read_volatile(), 0x66, "the title's later write stays");
         }
         unregister(p, p as u64);
+    }
+
+    /// A title buffer over a pool and, after it, a plain allocation (memory
+    /// that is not the runtime's): the pool is tracked and guarded; the
+    /// plain allocation's bytes are copied at each use and never guarded,
+    /// so a value the title keeps there reaches the copy, and again after
+    /// the title changes it.
+    #[test]
+    fn bytes_off_the_runtimes_memory_are_copied_at_each_use() {
+        use crate::watch::tests::{MEM_WRITE_WATCH, free};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree, VirtualQuery,
+        };
+        // A pool page and a plain one right after it, in two pages found free
+        // (other tests allocate meanwhile: tried again if taken).
+        let (pool, plain) = (0..8)
+            .find_map(|_| {
+                // SAFETY: a fresh reservation, released at once; then
+                // allocations where it was, freed below.
+                unsafe {
+                    let p = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+                    VirtualFree(p as *mut _, 0, MEM_RELEASE);
+                    let at = |q: usize, kind: u32| {
+                        VirtualAlloc(q as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | kind, PAGE_READWRITE) as usize
+                    };
+                    let (pool, plain) = (at(p, MEM_WRITE_WATCH), at(p + PAGE, 0));
+                    if p != 0 && pool == p && plain == p + PAGE {
+                        return Some((pool, plain));
+                    }
+                    [pool, plain].into_iter().filter(|&q| q != 0).for_each(free);
+                    None
+                }
+            })
+            .expect("two free pages");
+        let len = 2 * PAGE;
+        register(pool, pool as u64, len as u64);
+        let Some(copy) = find(pool as u64, len as u64) else {
+            unregister(pool, pool as u64);
+            [pool, plain].into_iter().for_each(free);
+            return; // no host GPU here
+        };
+        let word = (plain + 64) as *mut u32;
+        let protection = |p: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+            info.Protect
+        };
+        // SAFETY: a word of our plain allocation.
+        unsafe { word.write_volatile(0x1234) };
+        copy.update(pool, len);
+        assert_eq!(copy.read_host(word as u64, 1), [0x1234]);
+        assert!(!copy.clean(), "never clean: part of it is not tracked");
+        // SAFETY: as above.
+        unsafe { word.write_volatile(0x5678) };
+        copy.update(pool, len);
+        assert_eq!(copy.read_host(word as u64, 1), [0x5678], "the title's change reaches the copy");
+        assert_eq!(protection(pool), PAGE_READONLY, "the pool is guarded");
+        assert_eq!(protection(plain), PAGE_READWRITE, "the plain allocation is not");
+        unregister(pool, pool as u64);
+        // The pages stay allocated (as the other tests' pools): a copy some
+        // page table still holds must not name memory reused meanwhile.
+    }
+
+    /// Runs of the shared buffers start a whole number of elements (and of
+    /// 256 bytes) in, do not overlap, and join again when given back.
+    #[test]
+    fn arena_runs_are_aligned_to_their_elements_and_join_again() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let mut arena = Arena::default();
+        let (_, _, _, a) = arena.take(100, 456).unwrap();
+        let (_, _, _, b) = arena.take(5000, 16).unwrap();
+        let (_, _, _, c) = arena.take(4, 4).unwrap();
+        assert!(a.offset % 456 == 0 && a.offset % 256 == 0 && b.offset % 256 == 0);
+        let mut runs = [a, b, c].map(|s| (s.offset, s.offset + s.len));
+        runs.sort_unstable();
+        assert!(runs.windows(2).all(|w| w[0].1 <= w[1].0), "{runs:?}");
+        for s in [b, a, c] {
+            arena.give_back(s);
+        }
+        assert_eq!(arena.chunks.len(), 1);
+        assert_eq!(arena.chunks[0].3.len(), 1, "one free run again");
+        // Larger than a buffer: one of its own.
+        let (_, _, _, d) = arena.take(CHUNK + 1, 4).unwrap();
+        assert_eq!((arena.chunks.len(), d.chunk), (2, 1));
     }
 
     /// Ranges shaders write far apart are kept apart (not the copy between
@@ -1605,7 +1515,7 @@ mod tests {
         let p = crate::watch::tests::pool(3);
         let len = 3 * PAGE;
         register(p, p as u64, len as u64);
-        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap()) else {
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
             unregister(p, p as u64);
             return; // no host GPU here
         };
@@ -1631,7 +1541,7 @@ mod tests {
             // SAFETY: a dword of the mapped bitmap.
             unsafe { *bits.add(n / 32) |= 1 << (n % 32) };
         }
-        copy_back_marks(&[]);
+        copy_back_marks(&[], false);
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { title(at).read_volatile() };
         assert_eq!(read(10), 0xaa, "the shader's byte, page 0");
@@ -1641,6 +1551,80 @@ mod tests {
         let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
+        unregister(p, p as u64);
+    }
+
+    /// Marks of shaders using title memory stay out of title memory while
+    /// their results are held back, and are cleared; the other shaders'
+    /// marks of the same submission go back.
+    #[test]
+    fn marks_of_shaders_using_title_memory_are_held_back() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(others), Some(memory)) = (find(p as u64, len as u64), bitmap(false), bitmap(true)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(p, len);
+        copy.writing(p, len, true);
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
+        // Page 0 marked by another shader, page 1 by one using title memory.
+        for (b, n) in [(others, base), (memory, base + 1)] {
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *(b.data as *mut u32).add(n / 32) |= 1 << (n % 32) };
+        }
+        copy_back_marks(&[], true);
+        // SAFETY: bytes of our pool.
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        assert_eq!((read(10), read(PAGE + 10)), (0xaa, 0), "page 1 held back");
+        // SAFETY: a dword of the mapped bitmap.
+        assert_eq!(unsafe { *(memory.data as *const u32).add((base + 1) / 32) } & 1 << ((base + 1) % 32), 0, "cleared");
+        unregister(p, p as u64);
+    }
+
+    /// What a frame withheld leaves every host copy of its memory at the
+    /// frame's end (run textures9's shape): in frame N a program using title
+    /// memory writes a record into the copies and the frame misses, so it
+    /// stays out of title memory but in the copies for the GPU; in frame
+    /// N+1, which misses nothing, a program reading the record must see
+    /// title memory's bytes, not frame N's, in a title buffer's copy and in
+    /// an inner buffer's copy of the same pages alike.
+    #[test]
+    fn what_a_frame_withholds_leaves_the_copies_at_its_end() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        // SAFETY: a byte of our pool.
+        unsafe { ((p + 16) as *mut u8).write_volatile(0x11) };
+        register(p, p as u64, len as u64);
+        register(p + 1, p as u64, PAGE as u64);
+        let (Some(outer), Some(inner)) = (find(p as u64, len as u64), find(p as u64 + 16, 16)) else {
+            unregister(p + 1, p as u64);
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        assert!(!Arc::ptr_eq(&outer, &inner));
+        let byte = |c: &Shadow| c.read_host(p as u64 + 16, 1)[0] & 0xff;
+        for c in [&outer, &inner] {
+            let (start, n) = c.range();
+            c.update(start as usize, n as usize);
+            c.writing(start as usize, n as usize, false);
+            c.write_host(p as u64 + 16, &[0x22]);
+            c.keep_writes(start as usize, n as usize);
+        }
+        crate::memory::drop_withheld(p + 16, 4);
+        assert_eq!((byte(&outer), byte(&inner)), (0x22, 0x22), "frame N: the GPU's copies keep it");
+        crate::memory::log_frame();
+        for c in [&outer, &inner] {
+            let (start, n) = c.range();
+            c.update(start as usize, n as usize);
+        }
+        assert_eq!((byte(&outer), byte(&inner)), (0x11, 0x11), "frame N+1: title memory's bytes");
+        // SAFETY: as above.
+        assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0x11, "title memory untouched");
+        unregister(p + 1, p as u64);
         unregister(p, p as u64);
     }
 
@@ -1816,261 +1800,5 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
         // Too close to the top to round up to a window.
         assert!(loose(u64::MAX - 8, u64::MAX).is_none());
-    }
-
-    /// The committed part around a range, of one allocation, cut to 64 KiB.
-    #[test]
-    fn the_committed_part_of_a_window_holds_the_range_or_is_none() {
-        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
-        const K: u64 = 64 << 10;
-        // SAFETY: our own reservation; the middle 4 x 64 KiB committed.
-        let base = unsafe { VirtualAlloc(std::ptr::null(), (8 * K) as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
-        assert_ne!(base, 0);
-        // SAFETY: committing pages of our own reservation.
-        unsafe { VirtualAlloc((base + 2 * K) as *const _, (4 * K) as usize, MEM_COMMIT, PAGE_READWRITE) };
-        // A range in the committed middle: the committed part of the window.
-        assert_eq!(committed_part(base, 8 * K, base + 3 * K + 8, base + 3 * K + 16), Some((base + 2 * K, 4 * K)));
-        // Cut to the window.
-        assert_eq!(committed_part(base + 3 * K, K, base + 3 * K + 8, base + 3 * K + 16), Some((base + 3 * K, K)));
-        // A range reaching into reserved memory: none.
-        assert_eq!(committed_part(base, 8 * K, base + 6 * K - 8, base + 6 * K + 8), None);
-        assert_eq!(committed_part(base, 8 * K, base + 8, base + 16), None);
-        // SAFETY: our reservation.
-        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
-    }
-
-    /// Memory of one committed allocation becomes a host buffer in place:
-    /// what the CPU wrote there is what the buffer holds.
-    #[test]
-    fn committed_memory_opens_as_a_buffer_in_place() {
-        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
-        if host().is_none() {
-            return;
-        }
-        const LEN: u64 = 1 << 20;
-        // SAFETY: our own allocation.
-        let base = unsafe { VirtualAlloc(std::ptr::null(), LEN as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
-        assert_ne!(base, 0);
-        touch(base as usize, LEN as usize);
-        // SAFETY: our memory.
-        unsafe { *((base + (64 << 10)) as *mut u32) = 0x1234_5678 };
-        let Some((buffer, gpu)) = in_place_buffer(base + (64 << 10), 128 << 10) else {
-            // A host that cannot open process memory as a heap: copies stay.
-            // SAFETY: our allocation.
-            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
-            return;
-        };
-        assert_ne!(gpu, 0);
-        // SAFETY: a plain query on a live buffer.
-        assert_eq!(unsafe { buffer.GetDesc() }.Width, 128 << 10);
-        // Off 64 KiB: refused.
-        assert!(in_place_buffer(base + 4096, 64 << 10).is_none());
-        drop(buffer);
-        let_go_in_place(base, LEN);
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
-    }
-
-
-    /// A heap opened over an allocation that is released and made again
-    /// with another size is not handed out again.
-    #[test]
-    fn a_heap_over_a_released_allocation_is_let_go() {
-        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let _whole = WholeAllocations::on();
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
-        if host().is_none() {
-            return;
-        }
-        // SAFETY: our own allocation.
-        let base = unsafe { VirtualAlloc(std::ptr::null(), 1 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
-        assert_ne!(base, 0);
-        assert_eq!(allocation_extent(base), Some(1 << 20));
-        touch(base, 1 << 20);
-        if in_place_buffer(base as u64, 64 << 10).is_none() {
-            // SAFETY: our allocation.
-            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
-            return; // no heaps from process memory on this host
-        }
-        // SAFETY: our allocation.
-        let freed = unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) } != 0;
-        if !freed || allocation_extent(base).is_some() {
-            // Windows keeps memory a heap was opened over until the heap
-            // goes (Wine releases it at once): let go of it, then release.
-            let_go_in_place(base as u64, 1 << 20);
-            // SAFETY: our allocation.
-            assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0, "released once the heap is let go");
-        }
-        assert_eq!(allocation_extent(base), None);
-        // SAFETY: a new allocation, at that address if it is free.
-        let again = unsafe { VirtualAlloc(base as *const _, 2 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
-        if again == base {
-            touch(again, 2 << 20);
-            let (buffer, _) = in_place_buffer(base as u64, 2 << 20).expect("a heap over the new allocation");
-            // SAFETY: a plain query on a live buffer.
-            assert_eq!(unsafe { buffer.GetDesc() }.Width, 2 << 20, "placed in the new, larger heap");
-            drop(buffer);
-            // SAFETY: our allocation.
-            unsafe { VirtualFree(again as *mut _, 0, MEM_RELEASE) };
-        }
-        let_go_in_place(base as u64, 2 << 20);
-    }
-
-
-    /// A stale heap found while a caller holds `LOOSE` and `BUFFERS` (as
-    /// `loose` and `find` do) does not take those locks again.
-    #[test]
-    fn a_stale_heap_is_replaced_under_the_callers_locks() {
-        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let _whole = WholeAllocations::on();
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
-        if host().is_none() {
-            return;
-        }
-        // SAFETY: our own allocation.
-        let base = unsafe { VirtualAlloc(std::ptr::null(), 1 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
-        assert_ne!(base, 0);
-        touch(base, 1 << 20);
-        if in_place_buffer(base as u64, 64 << 10).is_none() {
-            // SAFETY: our allocation.
-            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
-            return; // no heaps from process memory on this host
-        }
-        // The cached heap no longer matches its allocation (as after the
-        // title released it and allocated again with another size). Made so
-        // in the cache itself: Windows does not change memory a heap was
-        // opened over while the heap lives.
-        if let Some(Some((_, size))) = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|h| h.get_mut(&base)) {
-            *size += 64 << 10;
-        }
-        {
-            let _loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-            let _buffers = buffers();
-            // Would wait on the locks above forever if it let go of what is
-            // placed in the heap here.
-            let _ = in_place_buffer(base as u64, 64 << 10);
-        }
-        assert!(STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(b, _)| b == base));
-        check_in_place();
-        assert!(STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).is_empty(), "let go at the frame's check");
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
-    }
-
-
-    /// The in-place tests share the heap cache and the queue of stale heaps
-    /// (and may get each other's addresses back): one at a time.
-    static IN_PLACE_TESTS: Mutex<()> = Mutex::new(());
-
-    /// Writes every page of `[base, base + len)`, so the allocation counts as
-    /// dense ([`dense`]).
-    fn touch(base: usize, len: usize) {
-        for page in (0..len).step_by(4096) {
-            // SAFETY: committed memory of the test's own allocation.
-            unsafe { ((base + page) as *mut u8).write_volatile(1) };
-        }
-    }
-
-    /// Takes the whole-allocation path for the life of the guard.
-    struct WholeAllocations;
-    impl WholeAllocations {
-        fn on() -> Self {
-            // Decisions of earlier tests may name an address given out again.
-            *DECIDED.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            WHOLE_ALLOCATIONS_ONLY.store(true, Ordering::Relaxed);
-            WholeAllocations
-        }
-    }
-    impl Drop for WholeAllocations {
-        fn drop(&mut self) {
-            WHOLE_ALLOCATIONS_ONLY.store(false, Ordering::Relaxed);
-        }
-    }
-
-    /// A sparse allocation (committed, mostly never touched) is not opened
-    /// whole: that would make all of it resident.
-    #[test]
-    fn a_sparse_allocation_is_not_opened_whole() {
-        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let _whole = WholeAllocations::on();
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
-        };
-        if host().is_none() {
-            return;
-        }
-        const LEN: usize = 16 << 20;
-        // SAFETY: our own allocation.
-        let base = unsafe {
-            VirtualAlloc(
-                std::ptr::null(),
-                LEN,
-                MEM_RESERVE | MEM_COMMIT,
-                PAGE_READWRITE,
-            )
-        } as usize;
-        assert_ne!(base, 0);
-        touch(base, 64 << 10);
-        assert!(
-            in_place_buffer(base as u64, 64 << 10).is_none(),
-            "1 of 256 pieces touched"
-        );
-        assert!(
-            IN_PLACE_HEAPS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .is_none_or(|h| !h.contains_key(&base))
-        );
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
-    }
-
-    /// Where the host opens sub-ranges, a buffer in place is a heap over its
-    /// own pages only, also in a sparse allocation, and no whole-allocation
-    /// heap is kept.
-    #[test]
-    fn a_sub_range_heap_covers_only_the_buffer() {
-        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        use windows::Win32::Graphics::Direct3D12::ID3D12Device13;
-        use windows::core::Interface;
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
-        };
-        let Some(host) = host() else { return };
-        if host.device.cast::<ID3D12Device13>().is_err() {
-            return; // no sub-range heaps on this host (vkd3d-proton)
-        }
-        const LEN: usize = 16 << 20;
-        // SAFETY: our own allocation.
-        let base = unsafe {
-            VirtualAlloc(
-                std::ptr::null(),
-                LEN,
-                MEM_RESERVE | MEM_COMMIT,
-                PAGE_READWRITE,
-            )
-        } as usize;
-        assert_ne!(base, 0);
-        let Some((buffer, gpu)) = in_place_buffer((base + (1 << 20)) as u64, 128 << 10) else {
-            // SAFETY: our allocation.
-            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
-            return; // the host refuses process memory as a heap
-        };
-        assert_ne!(gpu, 0);
-        // SAFETY: a plain query on a live buffer.
-        assert_eq!(unsafe { buffer.GetDesc() }.Width, 128 << 10);
-        assert!(
-            IN_PLACE_HEAPS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .is_none_or(|h| !h.contains_key(&base))
-        );
-        drop(buffer);
-        // SAFETY: our allocation; the heap went with the buffer.
-        assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);
     }
 }
