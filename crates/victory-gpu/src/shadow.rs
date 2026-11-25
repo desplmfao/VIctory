@@ -847,10 +847,33 @@ fn changed() {
 /// hold it. Changed under `BUFFERS`' lock.
 static MAX_SPAN: AtomicU64 = AtomicU64::new(0);
 
+/// Title buffers this long or longer are also kept in [`BIG`]: few, and
+/// they set [`MAX_SPAN`].
+const BIG_LEN: u64 = 1 << 20;
+
+/// The longest title buffer shorter than [`BIG_LEN`] registered so far. A
+/// lookup scans only that far below an address in [`BUFFERS`], then the
+/// few big buffers further below: a miss scanned every buffer within
+/// `MAX_SPAN` (174 MB in the world, about 480 entries on average).
+static SMALL_SPAN: AtomicU64 = AtomicU64::new(0);
+
+/// The big title buffers by (start, resource), with their end. Locked after
+/// [`BUFFERS`], and only while it is held.
+static BIG: Mutex<BTreeMap<(u64, usize), u64>> = Mutex::new(BTreeMap::new());
+
+fn big() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), u64>> {
+    BIG.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
     let mut map = buffers();
     MAX_SPAN.fetch_max(len, Ordering::Relaxed);
+    if len >= BIG_LEN {
+        big().insert((start, resource), start.saturating_add(len));
+    } else {
+        SMALL_SPAN.fetch_max(len, Ordering::Relaxed);
+    }
     map.insert(
         (start, resource),
         Entry {
@@ -862,7 +885,9 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
+    let mut map = buffers();
+    big().remove(&(start, resource));
+    if map.remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
         changed();
     }
 }
@@ -883,12 +908,51 @@ fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: 
         .map(|(k, _)| *k)
 }
 
+/// [`enclosing`] in two steps: the buffers starting within `small` (the
+/// longest buffer shorter than [`BIG_LEN`]) below `end`, then the big ones
+/// (`big`) starting further below, back to `span`. Only a big buffer can
+/// hold `[address, end)` from further below, so the result is the same.
+fn enclosing_split(
+    map: &BTreeMap<(u64, usize), Entry>,
+    big: &BTreeMap<(u64, usize), u64>,
+    small: u64,
+    span: u64,
+    address: u64,
+    end: u64,
+) -> Option<(u64, usize)> {
+    if let Some(key) = enclosing(map, small, address, end) {
+        return Some(key);
+    }
+    let lowest = end.saturating_sub(span);
+    let upper = end.saturating_sub(small).min(address.saturating_add(1));
+    if lowest >= upper {
+        return None;
+    }
+    big.range((lowest, 0)..(upper, 0))
+        .rev()
+        .find(|(_, big_end)| **big_end >= end)
+        .map(|(k, _)| *k)
+}
+
+/// The innermost title buffer holding `[address, end)`, under `BUFFERS`'
+/// lock (`map`).
+fn holding(map: &BTreeMap<(u64, usize), Entry>, address: u64, end: u64) -> Option<(u64, usize)> {
+    enclosing_split(
+        map,
+        &big(),
+        SMALL_SPAN.load(Ordering::Relaxed),
+        MAX_SPAN.load(Ordering::Relaxed),
+        address,
+        end,
+    )
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
-    let key = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end);
+    let key = holding(&map, address, end);
     let Some(key) = key else {
         drop(map);
         return loose(address, end);
@@ -1695,6 +1759,43 @@ mod tests {
     }
 
     #[test]
+    fn a_lookup_scans_small_buffers_near_the_address_then_the_big_ones() {
+        let base = 0x30_0000_0000u64;
+        let mut map = BTreeMap::new();
+        let mut big = BTreeMap::new();
+        // One big heap (64 MiB) holding many small placed buffers, and a
+        // second big buffer further up that ends before the address.
+        let heap = 64 * MIB;
+        map.insert((base, 1), Entry { end: base + heap, shadow: None });
+        big.insert((base, 1), base + heap);
+        for i in 0..400u64 {
+            let at = base + i * 0x10000;
+            map.insert((at, 10 + i as usize), Entry { end: at + 0x1000, shadow: None });
+        }
+        let other = base + 32 * MIB;
+        map.insert((other, 2), Entry { end: other + 2 * MIB, shadow: None });
+        big.insert((other, 2), other + 2 * MIB);
+        let small = 0x1000;
+        let span = heap;
+        // Past every small buffer and past `other`: only the heap holds it.
+        let at = base + 48 * MIB;
+        assert_eq!(enclosing_split(&map, &big, small, span, at, at + 16), Some((base, 1)));
+        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
+        // Inside a small buffer: that one, as before.
+        let at = base + 150 * 0x10000 + 8;
+        assert_eq!(enclosing_split(&map, &big, small, span, at, at + 8), Some((base + 150 * 0x10000, 160)));
+        // Inside `other`: the innermost big one.
+        let at = other + MIB;
+        assert_eq!(enclosing_split(&map, &big, small, span, at, at + 16), Some((other, 2)));
+        // Past the heap: none.
+        let at = base + heap + 16;
+        assert_eq!(enclosing_split(&map, &big, small, span, at, at + 16), None);
+        // A range longer than any small buffer still finds the heap.
+        let at = base + 50 * MIB;
+        assert_eq!(enclosing_split(&map, &big, small, span, at, at + 2 * small), Some((base, 1)));
+    }
+
+    #[test]
     fn registered_buffers_widen_the_search() {
         // High above anything a test maps; resource numbers no live
         // resource has.
@@ -1706,7 +1807,7 @@ mod tests {
         }
         assert!(MAX_SPAN.load(Ordering::Relaxed) >= len);
         let at = base + len - 64;
-        let found = enclosing(&buffers(), MAX_SPAN.load(Ordering::Relaxed), at, at + 64);
+        let found = holding(&buffers(), at, at + 64);
         for i in 0..100u64 {
             unregister(2 + i as usize, base + i * 0x1000);
         }
@@ -1737,6 +1838,53 @@ mod tests {
         assert_eq!(find(base + 3 * w, 1), None);
         assert_eq!(find(base - 8, 4), None);
         assert_eq!(find(base, 3 * w), None);
+    }
+
+    /// A range in one window, then a range across that window's end, which
+    /// gets a window of its own over both (the first inside it): what the
+    /// title writes reaches both copies, and what the GPU writes through
+    /// the spanning one goes back to title memory and from there into the
+    /// first at its next refresh. (Within one submission the two copies are
+    /// apart, as any two copies of the same bytes are.)
+    #[test]
+    fn overlapping_windows_agree_through_title_memory() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        if host().is_none() {
+            return;
+        }
+        let w = WINDOW as usize;
+        // SAFETY: a fresh allocation, released below.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * w, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let b = p.next_multiple_of(w);
+        let title = |at: usize| (b + at) as *mut u8;
+        // SAFETY: (all title reads and writes below) bytes of our allocation.
+        unsafe { title(w - 40).write_volatile(0x11) };
+        let first = loose((b + w - 64) as u64, (b + w - 32) as u64).expect("a window");
+        let spanning = loose((b + w - 16) as u64, (b + w + 16) as u64).expect("a window across the boundary");
+        assert!(!Arc::ptr_eq(&first, &spanning));
+        assert_eq!((first.start, first.len), (b as u64, w as u64));
+        assert_eq!((spanning.start, spanning.len), (b as u64, 2 * w as u64), "the first lies inside it");
+        let byte = |s: &Shadow, at: usize| s.read_host(((b + at) & !3) as u64, 1)[0].to_le_bytes()[(b + at) % 4];
+        // The title writes: both copies take it at their refresh.
+        // SAFETY: a byte of our allocation.
+        unsafe { title(w - 40).write_volatile(0x22) };
+        first.update(b + w - 64, 64);
+        spanning.update(b + w - 64, 64);
+        assert_eq!((byte(&first, w - 40), byte(&spanning, w - 40)), (0x22, 0x22));
+        // A shader writes through the spanning copy; it goes back to title
+        // memory, and the first copy takes it at its next refresh.
+        spanning.writing(b + w - 64, 64, false);
+        spanning.write_host((b + w - 40) as u64, &[0x33]);
+        spanning.copy_back(b + w - 64, 64);
+        // SAFETY: a byte of our allocation.
+        let back = unsafe { title(w - 40).read_volatile() };
+        assert_eq!(back, 0x33, "back in title memory");
+        first.update(b + w - 64, 64);
+        assert_eq!(byte(&first, w - 40), 0x33, "and in the first copy");
+        LOOSE.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(s, _), _| s != b as u64);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     #[test]
