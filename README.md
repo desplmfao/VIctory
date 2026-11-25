@@ -56,6 +56,7 @@ cargo build --profile diag -p victory --features diagnostics --target x86_64-pc-
 WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,d3dcompiler_47=n,b" \
 VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains \
 VICTORY_PIPELINE_JOURNAL=1 \
+VICTORY_LEVELS_ON_DEMAND=1 \
 proton runinprefix victory.exe run <game exe> --execute --console series-x
 ```
 
@@ -102,6 +103,9 @@ easier to read at 1–2 fps.
 | [#2118](https://github.com/Marvisak/VIctory/pull/2118) | 0xkn0wh3r3 | The BVH builder runs whole or not at all (a half-run builder wrote garbage into title memory) |
 | [#2311](https://github.com/Marvisak/VIctory/pull/2311) | Bullet18x | Programs that walk the BVH wait until the builder has run whole |
 | [#2310](https://github.com/Marvisak/VIctory/pull/2310) | desplmfao | Diagnostics, `VICTORY_GPU_BREADCRUMBS=1`: when a submission runs too long or the device is lost, names the draw or dispatch the GPU is in |
+| [#2366](https://github.com/Marvisak/VIctory/pull/2366) | r4tedx | A rectangle's fourth corner is across the diagonal from its right angle: removes the rows of light half-quad triangles along edges and silhouettes |
+| [#1152](https://github.com/Marvisak/VIctory/pull/1152) | pablogonz12 | No blending on integer render targets: the room's wall mesh pipeline is made instead of refused (walls no longer vanish now and then) |
+| [#2389](https://github.com/Marvisak/VIctory/pull/2389) | desplmfao (fxceless's mechanism, 507KAZ's tip) | Opt-in `VICTORY_LEVELS_ON_DEMAND=1`: streamed textures take video memory only for the levels the title holds (about 5 GB less) |
 
 Running under Proton is much faster with the wineserver patch from
 [#340](https://github.com/Marvisak/VIctory/issues/340); see
