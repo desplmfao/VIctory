@@ -56,15 +56,17 @@ cargo build --profile diag -p victory --features diagnostics --target x86_64-pc-
 WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,d3dcompiler_47=n,b" \
 VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains \
 VICTORY_PIPELINE_JOURNAL=1 \
-VICTORY_SKIP_PIPELINES=72f552f4553fb5f9,28918b7150a7aad5,4ddd6f9702fab2a7,caa78b8ca62bc3d6 \
 proton runinprefix victory.exe run <game exe> --execute --console series-x
 ```
 
-With #2167 in this branch, the three `XboxBvhBuilder` passes finish in time,
-but with them running the title itself crashed after about two minutes
-(being looked at), so keep them in the list for now. The hair passes hang
-NVIDIA with vkd3d-proton's raw access chains; with
-`VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains` they run.
+With #2167, #2118 and #2311 in this branch, no pipelines need skipping.
+#2167 lets Microsoft's BVH rehydration passes finish in time. #2118 holds
+the BVH builder back while any of its pipelines is missing; on NVIDIA five
+are refused, so it stays held back and ray-traced lighting does not run. A
+half-run builder wrote garbage into title memory: headless characters,
+triangles across the screen, and a title crash. #2311 keeps the passes that
+walk the BVH from running over an unbuilt one. Raw access chains off (above)
+lets the hair passes run; hair is not visible yet.
 
 Optional: set `<motionBlur value="false" />` in the title's
 `storage/settings/settings.xml` (in the data folder); the picture is far
@@ -97,6 +99,8 @@ easier to read at 1–2 fps.
 | [#158](https://github.com/Marvisak/VIctory/pull/158) | r4tedx | The depth bounds test reaches the host |
 | [#2292](https://github.com/Marvisak/VIctory/pull/2292) (draft) | desplmfao | Opt-in `VICTORY_PIPELINE_SOFT_CRASH=1`: a pipeline whose creation faults is refused and the title goes on |
 | [#2167](https://github.com/Marvisak/VIctory/pull/2167) | RVZO6 | Writes through title memory test the written-pages bit before the atomic OR: Microsoft's BVH rehydration passes no longer take the GPU past the driver's timeout |
+| [#2118](https://github.com/Marvisak/VIctory/pull/2118) | 0xkn0wh3r3 | The BVH builder runs whole or not at all (a half-run builder wrote garbage into title memory) |
+| [#2311](https://github.com/Marvisak/VIctory/pull/2311) | Bullet18x | Programs that walk the BVH wait until the builder has run whole |
 | [#2310](https://github.com/Marvisak/VIctory/pull/2310) | desplmfao | Diagnostics, `VICTORY_GPU_BREADCRUMBS=1`: when a submission runs too long or the device is lost, names the draw or dispatch the GPU is in |
 
 Running under Proton is much faster with the wineserver patch from
