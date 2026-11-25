@@ -54,13 +54,17 @@ Run (diagnostics build: the skip list works only there):
 cargo build --profile diag -p victory --features diagnostics --target x86_64-pc-windows-msvc
 # next to victory.exe: vkd3d-proton's d3d12.dll, d3d12core.dll and Microsoft's d3dcompiler_47.dll
 WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,d3dcompiler_47=n,b" \
+VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains \
 VICTORY_PIPELINE_JOURNAL=1 \
 VICTORY_SKIP_PIPELINES=72f552f4553fb5f9,28918b7150a7aad5,4ddd6f9702fab2a7,caa78b8ca62bc3d6 \
 proton runinprefix victory.exe run <game exe> --execute --console series-x
 ```
 
-With #2167 in this branch, the three `XboxBvhBuilder` passes finish in time
-and can be left out of the list; the hair passes still hang (being looked at).
+With #2167 in this branch, the three `XboxBvhBuilder` passes finish in time,
+but with them running the title itself crashed after about two minutes
+(being looked at), so keep them in the list for now. The hair passes hang
+NVIDIA with vkd3d-proton's raw access chains; with
+`VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains` they run.
 
 Optional: set `<motionBlur value="false" />` in the title's
 `storage/settings/settings.xml` (in the data folder); the picture is far
