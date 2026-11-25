@@ -32,6 +32,7 @@ Upstream base: Marvisak/VIctory `main` at `940d32f`.
 | [#2088](https://github.com/Marvisak/VIctory/pull/2088) | kxiserino ([#402](https://github.com/Marvisak/VIctory/pull/402)), desplmfao | Reuses loose windows that hold a range; 256 KiB windows instead of 4 MiB |
 | [#2112](https://github.com/Marvisak/VIctory/pull/2112) | desplmfao | Opt-in (`VICTORY_IN_PLACE=1`): title memory read in place instead of copied; on vkd3d-proton only allocations already 90% resident (opening one pins all of it) |
 | [#2162](https://github.com/Marvisak/VIctory/pull/2162) | desplmfao | Depth twins share their scratch buffers (about 280 MB video memory) |
+| [#2218](https://github.com/Marvisak/VIctory/pull/2218) | desplmfao (from youroot-code's fxceless/victory-fork#23) | GameInput keeps 256 readings per device, not 32 (input read through the history is not lost at low frame rates) |
 
 Running under Proton is much faster with the wineserver patch from
 [#340](https://github.com/Marvisak/VIctory/issues/340); see
