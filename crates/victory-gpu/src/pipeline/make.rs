@@ -262,17 +262,7 @@ fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
         let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        (0..n)
-            .filter(|i| {
-                let spawned = std::thread::Builder::new()
-                    .name(format!("victory-pipelines-{i}"))
-                    .spawn(work);
-                if let Err(e) = &spawned {
-                    tracing::warn!(error = %e, "no pipeline worker");
-                }
-                spawned.is_ok()
-            })
-            .count()
+        (0..n).filter(|&i| spawn_worker(i)).count()
     });
     if workers == 0 {
         // No worker: made here instead.
@@ -287,14 +277,29 @@ fn queue(p: Arc<Pending>, now: bool) {
     work.notify_one();
 }
 
+/// Starts pipeline worker `i`, with room for compilers that recurse deeply.
+fn spawn_worker(i: usize) -> bool {
+    let spawned = std::thread::Builder::new()
+        .name(format!("victory-pipelines-{i}"))
+        .stack_size(super::soft_crash::WORKER_STACK)
+        .spawn(move || work(i));
+    if let Err(e) = &spawned {
+        tracing::warn!(error = %e, "no pipeline worker");
+    }
+    spawned.is_ok()
+}
+
 /// A worker: makes queued pipelines, those draws wait for first, and saves
 /// the cache when idle (first uses of pipelines made before).
-fn work() {
+fn work(i: usize) {
     // Below the title's own threads (loading, recording).
     // SAFETY: a plain call on our own thread.
     unsafe {
         use windows::Win32::System::Threading::*;
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+    if super::soft_crash::enabled() {
+        super::soft_crash::arm();
     }
     let (lock, work) = &QUEUES;
     loop {
@@ -323,6 +328,14 @@ fn work() {
             drained();
         } else {
             super::library::save(false);
+        }
+        if super::soft_crash::spent() {
+            // A creation faulted here (`VICTORY_PIPELINE_SOFT_CRASH`): this
+            // stack may have lost its guard page. A fresh thread takes over.
+            if !spawn_worker(i) {
+                tracing::error!("no pipeline worker to take over from one whose creation faulted");
+            }
+            return;
         }
     }
 }

@@ -395,6 +395,14 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// A creation that faulted (`VICTORY_PIPELINE_SOFT_CRASH`) refuses the
+/// pipeline from now on, and in the journal.
+fn faulted(key: &str, detail: &str) {
+    if let Some(f) = super::soft_crash::take_fault() {
+        super::journal::faulted(key, detail, f.code, f.address);
+    }
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -646,6 +654,7 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
+                    faulted(&key, &detail);
                     return None;
                 }
             };
@@ -694,6 +703,7 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
+                    faulted(&key, &detail);
                     return None;
                 }
             };
@@ -787,6 +797,7 @@ impl HostPipeline {
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
+                faulted(&key, &detail);
                 return None;
             }
         };
