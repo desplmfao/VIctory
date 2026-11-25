@@ -55,7 +55,7 @@ cargo build --profile diag -p victory --features diagnostics --target x86_64-pc-
 # next to victory.exe: vkd3d-proton's d3d12.dll, d3d12core.dll and Microsoft's d3dcompiler_47.dll
 WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,d3dcompiler_47=n,b" \
 VICTORY_PIPELINE_JOURNAL=1 \
-VICTORY_SKIP_PIPELINES=72f552f4553fb5f9,28918b7150a7aad5,4ddd6f9702fab2a7,caa78b8ca62bc3d6 \
+VICTORY_SKIP_PIPELINES=72f552f4553fb5f9,28918b7150a7aad5,4ddd6f9702fab2a7,caa78b8ca62bc3d6   # see below: with #2167 the last three can go \
 proton runinprefix victory.exe run <game exe> --execute --console series-x
 ```
 
@@ -78,7 +78,7 @@ easier to read at 1–2 fps.
 | [#2162](https://github.com/Marvisak/VIctory/pull/2162) | desplmfao | Depth twins share their scratch buffers (about 280 MB video memory) |
 | [#2218](https://github.com/Marvisak/VIctory/pull/2218) | desplmfao (from youroot-code's fxceless/victory-fork#23) | GameInput keeps 256 readings per device, not 32 (input read through the history is not lost at low frame rates) |
 | [#439](https://github.com/Marvisak/VIctory/pull/439) (with #233, #320) | r4tedx | Wave64 compute on 32-lane GPUs (NVIDIA): one console wave runs in the console flow |
-| `fix/w64-nvidia-compile` (not opened yet) | powplusplus ([#1885](https://github.com/Marvisak/VIctory/pull/1885), one commit), desplmfao | One back edge per loop header and per block, so vkd3d-proton's dxil-spirv converts #439's loops instead of recursing until the process dies |
+| [#2309](https://github.com/Marvisak/VIctory/pull/2309) | powplusplus ([#1885](https://github.com/Marvisak/VIctory/pull/1885), one commit), desplmfao | One back edge per loop header and per block, so vkd3d-proton's dxil-spirv converts #439's loops instead of recursing until the process dies |
 | [#67](https://github.com/Marvisak/VIctory/pull/67) | alessiodeia | Texture-to-buffer copies (the title reads its exposure back this way) |
 | [#1722](https://github.com/Marvisak/VIctory/pull/1722) | Impre-visible | The host pipeline library works under Wine |
 | [#1769](https://github.com/Marvisak/VIctory/pull/1769) | Impre-visible | LDS accesses outside the program's allocation read 0 |
@@ -89,7 +89,8 @@ easier to read at 1–2 fps.
 | [#1872](https://github.com/Marvisak/VIctory/pull/1872) | BastienRodz | The depth twin's converter builds its root signature under Wine |
 | [#158](https://github.com/Marvisak/VIctory/pull/158) | r4tedx | The depth bounds test reaches the host |
 | [#2292](https://github.com/Marvisak/VIctory/pull/2292) (draft) | desplmfao | Opt-in `VICTORY_PIPELINE_SOFT_CRASH=1`: a pipeline whose creation faults is refused and the title goes on |
-| `diag/gpu-breadcrumbs` (not opened yet) | desplmfao | Diagnostics, `VICTORY_GPU_BREADCRUMBS=1`: when a submission runs too long or the device is lost, names the draw or dispatch the GPU is in |
+| [#2167](https://github.com/Marvisak/VIctory/pull/2167) | RVZO6 | Writes through title memory test the written-pages bit before the atomic OR: Microsoft's BVH rehydration passes no longer take the GPU past the driver's timeout |
+| [#2310](https://github.com/Marvisak/VIctory/pull/2310) | desplmfao | Diagnostics, `VICTORY_GPU_BREADCRUMBS=1`: when a submission runs too long or the device is lost, names the draw or dispatch the GPU is in |
 
 Running under Proton is much faster with the wineserver patch from
 [#340](https://github.com/Marvisak/VIctory/issues/340); see
