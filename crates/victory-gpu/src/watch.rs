@@ -324,12 +324,13 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
 /// guard handler waited for the guard lock, whose holder waited for the heap
 /// lock (the crate's tests hung).
 ///
-/// shortcut: memory free or reserved when the range is tracked counts as the
-/// runtime's; another allocator committing it before the first take would
-/// have it guarded.
+/// Free memory is not the runtime's (#1849): a window over free memory would
+/// guard whatever is allocated there later, and under Wine the process heap
+/// lies in the first 4 MiB. shortcut: memory reserved when the range is
+/// tracked counts as the runtime's.
 fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
     use windows_sys::Win32::System::Memory::{
-        GetWriteWatch, MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        GetWriteWatch, MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     let watched = |at: usize, len: usize| {
         let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
@@ -353,7 +354,10 @@ fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
         }
         let next = (info.BaseAddress as usize + info.RegionSize).max(at + 1).min(end);
         let ours = watched(at, next - at)
-            || views && info.Type != MEM_IMAGE && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
+            || views
+                && info.State != MEM_FREE
+                && info.Type != MEM_IMAGE
+                && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
         (if ours { &mut runtime } else { &mut other }).extend(at / PAGE..next.div_ceil(PAGE));
         at = next;
     }
@@ -1032,6 +1036,19 @@ pub(crate) mod tests {
         drop(t);
         // SAFETY: our reservation.
         unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Free memory is not tracked: the window a null address falls in (a
+    /// loose copy of title memory starting at 0). Tracked, its blocks would
+    /// be guarded once something is allocated there: under Wine the process
+    /// heap, whose writes then fault into the handler while a thread holds
+    /// the guard lock.
+    #[test]
+    fn free_memory_is_not_tracked() {
+        assert!(
+            track(0, 4 << 20, true).is_none(),
+            "the window of a null address"
+        );
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
