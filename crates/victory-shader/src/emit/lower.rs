@@ -11472,6 +11472,12 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lowers_as(words, rsrc2, false)
+    }
+
+    /// [`lowers`], kept to the per-lane form with `per_lane_only` (what
+    /// `emit` falls back to when the console flow cannot lower a program).
+    fn lowers_as(words: &[u32], rsrc2: u32, per_lane_only: bool) -> Result<(), crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -11501,7 +11507,7 @@ mod tests {
             mesh_stride: 0,
             target: super::super::Target::ANY,
             console_cf: false,
-            per_lane_only: false,
+            per_lane_only,
             view_marks: false,
         })
         .map(|_| ())
@@ -12346,7 +12352,9 @@ mod tests {
             0xBEFE_0304, // s_mov_b32 exec_lo, s4
             S_ENDPGM,
         ];
-        lowers(&words, 1 << 7).expect("a lane read under an EXEC with no mask");
+        // A `v_readlane` past a per-lane branch asks for the console flow
+        // first (#439); the per-lane form is what this test is about.
+        lowers_as(&words, 1 << 7, true).expect("a lane read under an EXEC with no mask");
     }
 
     #[test]
