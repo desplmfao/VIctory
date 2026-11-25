@@ -292,6 +292,10 @@ pub(crate) struct HostPipeline {
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// Our root parameters of the view-mark table and the buffer views'
+    /// written-pages bitmap, if a stage marks its writes through views
+    /// (`victory_shader::emit`, "Write marks").
+    pub(crate) marks: Option<(u32, u32)>,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -366,6 +370,19 @@ impl HostPipeline {
                 shaders,
             );
         }
+
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        // Older runtimes may not recognize OPTIONS19; that means no support.
+        let aniso_point_mip_supported = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool();
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -452,7 +469,7 @@ impl HostPipeline {
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(s.filter as i32),
+                    Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
                     AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
                     AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
                     AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
@@ -469,6 +486,30 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        // One pair for all stages: they share the heap and the bitmap.
+        let marks = stages
+            .iter()
+            .any(|(s, _)| s.translated().is_some_and(|t| t.host.view_marks))
+            .then(|| {
+                let first = params.len() as u32;
+                for (kind, register) in [
+                    (D3D12_ROOT_PARAMETER_TYPE_SRV, victory_shader::emit::VIEW_MARKS),
+                    (D3D12_ROOT_PARAMETER_TYPE_UAV, victory_shader::emit::VIEW_WRITES),
+                ] {
+                    params.push(D3D12_ROOT_PARAMETER1 {
+                        ParameterType: kind,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                                ShaderRegister: register,
+                                RegisterSpace: MEMORY_SPACE,
+                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                            },
+                        },
+                        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                    });
+                }
+                (first, first + 1)
+            });
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -520,6 +561,7 @@ impl HostPipeline {
                 rectangles: false,
                 slots: 0,
                 inputs: Vec::new(),
+                marks,
             });
         }
         let Some(g) = g else {
@@ -553,6 +595,7 @@ impl HostPipeline {
                 rectangles: false,
                 slots: 0,
                 inputs: Vec::new(),
+                marks,
             });
         }
 
@@ -637,6 +680,7 @@ impl HostPipeline {
             rectangles: !gs.is_empty(),
             slots: g.slots(),
             inputs: g.elements(),
+            marks,
         })
     }
 }
