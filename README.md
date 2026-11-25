@@ -250,6 +250,14 @@ single pipeline is being created looks like a crash to the next run: delete
 that pipeline's line from `crashed.txt` (the comment above it names its
 stages) to have it tried again.
 
+With `VICTORY_PIPELINE_SOFT_CRASH=1` as well, a pipeline whose creation
+faults (an access violation, illegal instruction or stack overflow in the
+host's shader compiler) does not end the process: that pipeline is refused
+at once, written to `crashed.txt`, and the title goes on. The pipeline workers
+get a 256 MiB stack. After 8 caught faults a fault ends the process again.
+It is opt-in: a lock the compiler held when it faulted stays held, and new
+pipelines can then stop arriving.
+
 ### Windows shader-test validator
 
 The shader tests use `dxil.dll` to validate Shader Model 6.6 containers.
