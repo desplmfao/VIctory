@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{Crumb, HostList, host, transition};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
@@ -206,7 +206,7 @@ pub(crate) fn bound(
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
         // One group walks every record.
-        l.Dispatch(records.min(1), 1, 1);
+        list.crumbed(Crumb::Dispatch, Some("indirect argument clamp (ours)"), || l.Dispatch(records.min(1), 1, 1));
         l.ResourceBarrier(&[
             uav_barrier(),
             transition(
