@@ -17,6 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -46,6 +47,10 @@ pub(crate) struct Shadow {
     /// 64 KiB title page it touches (tracked memory only): writes through
     /// views of it are marked there ([`Shadow::mark_entry`]).
     marks: Option<u32>,
+    /// The host buffer is the title memory itself (`VICTORY_IN_PLACE`): a
+    /// buffer placed in a heap opened over the title's allocation, so there
+    /// is nothing to copy either way.
+    in_place: bool,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -162,6 +167,9 @@ impl Shadow {
     // shortcut: a page the copy holds only in part (at its ends) has no
     // "copied" mark and is compared without the title-write check.
     pub(crate) fn copy_back_page(&self, page: usize) -> usize {
+        if self.in_place {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
@@ -200,12 +208,19 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.in_place {
+            return;
+        }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
-        let tracked = crate::watch::track(start as usize, len as usize, true);
+        Self::new_with(buffer, data, gpu, start, len, false)
+    }
+
+    fn new_with(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, in_place: bool) -> Arc<Shadow> {
+        let tracked = if in_place { None } else { crate::watch::track(start as usize, len as usize, true) };
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
             buffer,
@@ -217,6 +232,7 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             marks,
+            in_place,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -261,6 +277,9 @@ impl Shadow {
     /// views (`victory_shader::emit`, "Write marks"): no snapshot then, only
     /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
+        if self.in_place {
+            return;
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
     }
@@ -277,6 +296,9 @@ impl Shadow {
     /// a title write there before the copy-back keeps the page's bytes from
     /// before it ([`crate::watch::Tracked::arm`]).
     pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
+        if self.in_place {
+            return;
+        }
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -331,6 +353,9 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        if self.in_place {
+            return 0;
+        }
         self.copy_back_or_not(address, len, true)
     }
 
@@ -338,6 +363,9 @@ impl Shadow {
     /// in the copy and does not go into title memory (they computed it
     /// from memory with no copy, `crate::memory`).
     pub(crate) fn keep_writes(&self, address: usize, len: usize) {
+        if self.in_place {
+            return;
+        }
         self.copy_back_or_not(address, len, false);
     }
 
@@ -433,6 +461,9 @@ impl Shadow {
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
     pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
+        if self.in_place {
+            return 0;
+        }
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -488,6 +519,9 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        if self.in_place {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -808,12 +842,19 @@ fn changed() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// The longest title buffer registered so far (it stays after the buffer is
+/// released): a buffer starting further below an address than this cannot
+/// hold it. Changed under `BUFFERS`' lock.
+static MAX_SPAN: AtomicU64 = AtomicU64::new(0);
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    MAX_SPAN.fetch_max(len, Ordering::Relaxed);
+    map.insert(
         (start, resource),
         Entry {
-            end: start + len,
+            end: start.saturating_add(len),
             shadow: None,
         },
     );
@@ -826,22 +867,52 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     }
 }
 
+/// The innermost entry holding `[address, end)`: the one starting closest
+/// below `address` that reaches `end`, among those starting at most `span`
+/// (the longest entry's length) below `end`. Big buffers hold many smaller
+/// ones (a heap's placed buffers), so the one holding an address past
+/// those can be any number of entries back.
+fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: u64) -> Option<(u64, usize)> {
+    let lowest = end.saturating_sub(span);
+    if lowest > address {
+        return None;
+    }
+    map.range((lowest, 0)..=(address, usize::MAX))
+        .rev()
+        .find(|(_, e)| e.end >= end)
+        .map(|(k, _)| *k)
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
+    let key = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end);
     let Some(key) = key else {
         drop(map);
         return loose(address, end);
     };
     let entry = map.get_mut(&key)?;
+    if entry.shadow.is_none() && in_place_enabled() {
+        // In place: from the 64 KiB boundary at or below the buffer (views
+        // find their bytes by address, `Shadow::offset`), past its end by the
+        // 256 bytes a view ending in its last bytes reads where the
+        // allocation has them, else to its end.
+        const G: u64 = 64 << 10;
+        let lo = key.0 / G * G;
+        let part = [entry.end + 256, entry.end].into_iter().find_map(|end| {
+            let hi = end.next_multiple_of(G);
+            committed_part(lo, hi - lo, key.0, end)
+        });
+        if let Some((s0, l0)) = part
+            && let Some((buffer, gpu)) = in_place_buffer(s0, l0)
+        {
+            crate::host::name(&buffer, || format!("title buffer in place {:#x}+{:#x}", key.0, entry.end - key.0));
+            entry.shadow = Some(Shadow::new_with(buffer, s0 as *mut u8, gpu, s0, l0, true));
+            changed();
+        }
+    }
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -869,22 +940,432 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     entry.shadow.clone()
 }
 
+/// `VICTORY_IN_PLACE=1` (experimental, #880): title buffers and loose
+/// windows are the title's memory itself, opened as a host heap, instead of
+/// copies.
+fn in_place_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_IN_PLACE").is_some_and(|v| v == "1"))
+}
+
+
+/// A heap opened over a title allocation and its size; `None` if it could
+/// not be opened.
+type OpenedHeap = Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>;
+
+/// Host heaps opened over title allocations, by allocation base.
+static IN_PLACE_HEAPS: Mutex<Option<std::collections::HashMap<usize, OpenedHeap>>> = Mutex::new(None);
+
+/// The size of the allocation starting at `base` if all of it is still
+/// committed memory of that allocation, else `None`.
+fn allocation_extent(base: usize) -> Option<u64> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut at = base;
+    loop {
+        // SAFETY: plain data, filled by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0
+            || info.AllocationBase as usize != base
+        {
+            return (at > base).then(|| (at - base) as u64);
+        }
+        if info.State != MEM_COMMIT {
+            return None;
+        }
+        at = info.BaseAddress as usize + info.RegionSize;
+    }
+}
+
+/// The share of an allocation's pages that must already be in memory
+/// before it is opened as a heap (percent; `VICTORY_IN_PLACE_DENSITY`).
+fn density_wanted() -> u64 {
+    static WANTED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *WANTED.get_or_init(|| {
+        std::env::var("VICTORY_IN_PLACE_DENSITY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90)
+            .min(100)
+    })
+}
+
+/// Density decisions by allocation (base and size: an allocation made
+/// again at the same address is a new one), and when they were made.
+type Decided = std::collections::HashMap<(usize, u64), (bool, std::time::Instant)>;
+static DECIDED: Mutex<Option<Decided>> = Mutex::new(None);
+
+/// Whether most of the allocation at `base` (`size` bytes) is already in
+/// memory. Opening a heap over an allocation makes all of it resident:
+/// importing it as host memory pins every page, also committed pages the
+/// title never touched, which cost nothing until then (Grand Theft Auto VI
+/// on Linux: 1.9 GB more anonymous memory against 1.4 GB fewer copies, so
+/// in place cost more than the copies it replaced). A sparse allocation
+/// keeps its copies. Asked again after 10 s, as the title fills its
+/// allocations.
+fn dense(base: usize, size: Option<u64>) -> bool {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let Some(size) = size else { return false };
+    if let Some(&(dense, when)) = DECIDED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|d| d.get(&(base, size)))
+        && when.elapsed() < std::time::Duration::from_secs(10)
+    {
+        return dense;
+    }
+    // At most 64Ki pages asked, evenly spread over the allocation.
+    let pages = (size / 4096).max(1);
+    let step = pages.div_ceil(1 << 16);
+    let mut asked: Vec<PSAPI_WORKING_SET_EX_INFORMATION> = (0..pages.div_ceil(step))
+        .map(|i| PSAPI_WORKING_SET_EX_INFORMATION {
+            VirtualAddress: (base as u64 + i * step * 4096) as *mut _,
+            ..Default::default()
+        })
+        .collect();
+    // SAFETY: our own process and an array of the size given.
+    let ok = unsafe {
+        K32QueryWorkingSetEx(
+            GetCurrentProcess(),
+            asked.as_mut_ptr().cast(),
+            (asked.len() * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+        )
+    } != 0;
+    // SAFETY: the union's flags word; bit 0 is "valid" (in memory).
+    let resident = asked
+        .iter()
+        .filter(|a| unsafe { a.VirtualAttributes.Flags } & 1 != 0)
+        .count() as u64;
+    let dense = ok && resident * 100 >= asked.len() as u64 * density_wanted();
+    tracing::debug!(
+        base = format_args!("{base:#x}"),
+        size,
+        resident,
+        asked = asked.len(),
+        dense,
+        "title allocation density"
+    );
+    DECIDED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert((base, size), (dense, std::time::Instant::now()));
+    dense
+}
+
+/// Once a frame: heaps opened over allocations the title has released or
+/// changed since (another size, or not all committed) are let go with the
+/// in-place windows and title buffers over them, as on a remap. The title
+/// frees some of its memory itself, unseen by us; what this cannot tell is
+/// an allocation released and made again at the same address and size.
+pub(crate) fn check_in_place() {
+    let pending = std::mem::take(&mut *STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()));
+    for (base, size) in pending {
+        let_go_in_place(base as u64, size);
+    }
+    if !in_place_enabled() {
+        return;
+    }
+    let stale: Vec<(usize, u64)> = {
+        let heaps = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        heaps
+            .iter()
+            .flat_map(|h| h.iter())
+            .filter_map(|(&base, v)| v.as_ref().map(|(_, size)| (base, *size)))
+            .filter(|&(base, size)| allocation_extent(base) != Some(size))
+            .collect()
+    };
+    for (base, size) in stale {
+        let_go_in_place(base as u64, size);
+    }
+}
+
+/// Heaps found stale while a caller held `BUFFERS` or `LOOSE`: what is placed
+/// in them is let go at the next frame's check.
+static STALE_IN_PLACE: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+
+/// Title memory `[at, at + len)` was mapped or unmapped: in-place windows
+/// and title buffers over it, and heaps opened over allocations it touches show the old pages
+/// (pinned while a list still holds them), so lookups get new ones.
+pub(crate) fn in_place_remapped(at: u64, len: u64) {
+    if in_place_enabled() {
+        let_go_in_place(at, len);
+    }
+}
+
+/// Lets go of in-place windows and title buffers over `[at, at + len)` and
+/// heaps opened over allocations it touches.
+fn let_go_in_place(at: u64, len: u64) {
+    let end = at.saturating_add(len);
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let before = map.len();
+    map.retain(|&(s, l), sh| !(sh.in_place && s < end && at < s + l));
+    let mut gone = before - map.len();
+    drop(map);
+    for e in buffers().values_mut() {
+        if e.shadow.as_ref().is_some_and(|sh| sh.in_place && sh.start < end && at < sh.start + sh.len) {
+            e.shadow = None;
+            gone += 1;
+        }
+    }
+    let mut heaps = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = heaps.as_mut() {
+        h.retain(|&base, v| match v {
+            Some((_, size)) => !((base as u64) < end && at < base as u64 + *size),
+            None => true,
+        });
+    }
+    drop(heaps);
+    if gone > 0 {
+        changed();
+    }
+}
+
+/// The part of window `[start, start + len)` around `[address, end)` that
+/// is committed memory of one allocation, cut to 64 KiB: `None` unless it
+/// holds `[address, end)`.
+fn committed_part(start: u64, len: u64, address: u64, end: u64) -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    const G: u64 = 64 << 10;
+    let query = |at: u64| -> Option<MEMORY_BASIC_INFORMATION> {
+        // SAFETY: plain data, filled by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        (unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } != 0).then_some(info)
+    };
+    let first = query(address)?;
+    if first.State != MEM_COMMIT {
+        return None;
+    }
+    let base = first.AllocationBase as u64;
+    // Down from the region holding `address`, while committed and the same allocation.
+    let mut lo = first.BaseAddress as u64;
+    while lo > start {
+        match query(lo - 1) {
+            Some(i) if i.State == MEM_COMMIT && i.AllocationBase as u64 == base => lo = i.BaseAddress as u64,
+            _ => break,
+        }
+    }
+    let mut hi = first.BaseAddress as u64 + first.RegionSize as u64;
+    while hi < start + len {
+        match query(hi) {
+            Some(i) if i.State == MEM_COMMIT && i.AllocationBase as u64 == base => hi = i.BaseAddress as u64 + i.RegionSize as u64,
+            _ => break,
+        }
+    }
+    // A placed buffer starts at a multiple of 64 KiB; its end only needs to
+    // be committed pages.
+    let lo = lo.max(start).next_multiple_of(G);
+    let hi = (hi.min(start + len)) / 4096 * 4096;
+    (lo <= address && end <= hi).then(|| (lo, hi - lo))
+}
+
+/// A host buffer that is the title memory `[start, start + len)` itself:
+/// placed at its offset in a heap opened over the allocation holding it.
+/// `None` where that cannot be (not one committed allocation, the heap
+/// refused, a placement off 64 KiB).
+fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let refuse = |_why: &str| None;
+    // The whole range committed, in one allocation.
+    let mut base = 0usize;
+    let mut at = start as usize;
+    while at < (start + len) as usize {
+        // SAFETY: plain data, filled by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 || info.State != MEM_COMMIT {
+            return refuse("not committed");
+        }
+        let b = info.AllocationBase as usize;
+        if base == 0 {
+            base = b;
+        } else if b != base {
+            return refuse("several allocations");
+        }
+        at = info.BaseAddress as usize + info.RegionSize;
+    }
+    let offset = start - base as u64;
+    if !offset.is_multiple_of(64 << 10) {
+        return refuse("offset");
+    }
+    let host = host()?;
+    // Where the host opens a sub-range, only the buffer's own pages become
+    // a heap: nothing else of the allocation is pinned, and the placed
+    // buffer holds its heap, so the heap goes with the buffer.
+    if !whole_allocations_only()
+        && let Ok(dev13) = host.device.cast::<ID3D12Device13>()
+    {
+        let size = len.next_multiple_of(4096) as usize;
+        // SAFETY: committed pages of one allocation of the title's, from
+        // a 64 KiB boundary of it.
+        let opened = unsafe { dev13.OpenExistingHeapFromAddress1::<ID3D12Heap>(start as *const _, size) };
+        if let Ok(heap) = opened {
+            return place_in(&host.device, &heap, 0, len).or_else(|| refuse("placement refused"));
+        }
+    }
+    // A heap opened earlier over an allocation the title has released or
+    // changed since goes first, with what is placed in it.
+    let extent = allocation_extent(base);
+    let stale = {
+        let heaps = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        heaps
+            .as_ref()
+            .and_then(|h| h.get(&base))
+            .and_then(|v| v.as_ref().map(|(_, size)| *size))
+            .filter(|&size| extent != Some(size))
+    };
+    // Only the heap goes here: the callers hold `BUFFERS` or `LOOSE`, which
+    // letting go of what is placed in it takes, so that waits for the next
+    // frame's check ([`check_in_place`]), outside those locks.
+    let mut heaps = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(size) = stale {
+        if let Some(h) = heaps.as_mut() {
+            h.remove(&base);
+        }
+        STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).push((base, size));
+    }
+    if !heaps.as_ref().is_some_and(|h| h.contains_key(&base)) && !dense(base, extent) {
+        return refuse("sparse");
+    }
+    let heap = heaps.get_or_insert_with(Default::default).entry(base).or_insert_with(|| {
+        let dev3: ID3D12Device3 = host.device.cast().ok()?;
+        // SAFETY: the base of a committed allocation of the title's.
+        let heap: ID3D12Heap = unsafe { dev3.OpenExistingHeapFromAddress(base as *const _) }.ok()?;
+        // SAFETY: a plain query.
+        let size = unsafe { heap.GetDesc() }.SizeInBytes;
+        tracing::debug!(base = format_args!("{base:#x}"), size, "title allocation opened as a host heap");
+        Some((heap, size))
+    });
+    let Some((heap, size)) = heap.clone() else {
+        return refuse("heap refused");
+    };
+    drop(heaps);
+    if offset + len > size {
+        return refuse("past the heap");
+    }
+    place_in(&host.device, &heap, offset, len).or_else(|| refuse("placement refused"))
+}
+
+/// Tests of the whole-allocation path (the heap cache, stale heaps) turn
+/// off sub-range heaps, which a host with `ID3D12Device13` would take.
+#[cfg(test)]
+static WHOLE_ALLOCATIONS_ONLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn whole_allocations_only() -> bool {
+    #[cfg(test)]
+    return WHOLE_ALLOCATIONS_ONLY.load(Ordering::Relaxed);
+    #[cfg(not(test))]
+    false
+}
+
+/// A buffer of `len` bytes placed at `offset` in `heap`, opened over title
+/// memory, and its GPU address.
+fn place_in(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    heap: &windows::Win32::Graphics::Direct3D12::ID3D12Heap,
+    offset: u64,
+    len: u64,
+) -> Option<(ID3D12Resource, u64)> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: len,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: a buffer inside the heap.
+    unsafe {
+        device.CreatePlacedResource(
+            heap,
+            offset,
+            &desc,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut buffer,
+        )
+    }
+    .ok()?;
+    let buffer = buffer?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    Some((buffer, gpu))
+}
+
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
-/// gets copies of the aligned windows it touches.
+/// gets copies of the aligned windows it touches. A window is 256 KiB:
+/// lookups while Grand Theft Auto VI loads its world touched about 30% of
+/// the 4 MiB windows this used to copy, so most of their bytes (GBs of host
+/// memory) were never asked for; smaller windows cost more of them, each a
+/// host buffer and a page-table entry.
 /// shortcut: copies of windows are never freed; key them to the title's
 /// allocations if memory use grows.
-const WINDOW: u64 = 4 << 20;
+const WINDOW: u64 = 256 << 10;
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// The longest window in `LOOSE`. Changed under its lock.
+static LOOSE_SPAN: AtomicU64 = AtomicU64::new(0);
+
+/// Below this nothing is ever mapped (the null page and its guard area).
+const LOWEST_MAPPED: u64 = 0x10000;
+
+/// The window copy holding `[address, end)` among `windows` (by start and
+/// length, none longer than `span`), the innermost if several do.
+fn enclosing_window<V>(windows: &BTreeMap<(u64, u64), V>, span: u64, address: u64, end: u64) -> Option<&V> {
+    let lowest = end.saturating_sub(span);
+    if lowest > address {
+        return None;
+    }
+    windows
+        .range((lowest, 0)..=(address, u64::MAX))
+        .rev()
+        .find(|&(&(s, l), _)| s.saturating_add(l) >= end)
+        .map(|(_, v)| v)
+}
+
+/// The window copy for `[address, end)` outside buffers: one already made
+/// that holds it (a range spanning two windows has one of its own, which
+/// later ranges in it share), else a new one. None for memory that is not
+/// committed (a stale or null address): 4 MiB of zeros would not help.
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    if address < LOWEST_MAPPED {
+        return None;
+    }
     let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    let len = end.checked_next_multiple_of(WINDOW)? - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
+    if let Some(shadow) = enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), address, end) {
         return Some(shadow.clone());
+    }
+    if !crate::texture::committed(address as *const u8, 1) {
+        return None;
+    }
+    if in_place_enabled()
+        && let Some((s0, l0)) = committed_part(start, len, address, end)
+        && let Some((buffer, gpu)) = in_place_buffer(s0, l0)
+    {
+        crate::host::name(&buffer, || format!("title memory in place {s0:#x}+{l0:#x}"));
+        let shadow = Shadow::new_with(buffer, s0 as *mut u8, gpu, s0, l0, true);
+        LOOSE_SPAN.fetch_max(l0, Ordering::Relaxed);
+        map.insert((s0, l0), shadow.clone());
+        changed();
+        return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
@@ -896,6 +1377,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Shadow::new(buffer, data, gpu, start, len);
+    LOOSE_SPAN.fetch_max(len, Ordering::Relaxed);
     map.insert((start, len), shadow.clone());
     changed();
     Some(shadow)
@@ -1162,5 +1644,372 @@ mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    fn entry(start: u64, len: u64) -> Entry {
+        Entry {
+            end: start + len,
+            shadow: None,
+        }
+    }
+
+    /// A 256 MiB parent with `children` 64 KiB buffers placed in its first
+    /// part, as a heap's placed buffers.
+    fn heap(base: u64, children: u64) -> BTreeMap<(u64, usize), Entry> {
+        let mut map = BTreeMap::new();
+        map.insert((base, 1), entry(base, 256 * MIB));
+        for i in 0..children {
+            map.insert((base + i * 0x10000, 100 + i as usize), entry(base + i * 0x10000, 0x10000));
+        }
+        map
+    }
+
+    #[test]
+    fn a_parent_is_found_past_many_children() {
+        let base = 0x10_0000_0000;
+        let map = heap(base, 200);
+        let span = 256 * MIB;
+        // Past all 200 children (and the 64 entries looked at before).
+        let at = base + 200 * 0x10000 + 0x100;
+        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
+        let first_64 = map.range(..=(at, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= at + 16);
+        assert!(first_64.is_none(), "the parent is more than 64 entries back");
+        // Near the parent's end.
+        let at = base + 256 * MIB - 16;
+        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
+        // Inside a child: the child, the innermost.
+        let at = base + 150 * 0x10000 + 8;
+        assert_eq!(enclosing(&map, span, at, at + 8), Some((base + 150 * 0x10000, 250)));
+        // Across two children: only the parent holds it.
+        let at = base + 151 * 0x10000 - 8;
+        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
+        // Past the parent, and before it.
+        let at = base + 256 * MIB;
+        assert_eq!(enclosing(&map, span, at, at + 1), None);
+        assert_eq!(enclosing(&map, span, base - 16, base + 16), None);
+        // Longer than any buffer: none, without looking.
+        assert_eq!(enclosing(&map, span, base, base + span + 1), None);
+        assert_eq!(enclosing(&map, 0, base, base + 1), None);
+    }
+
+    #[test]
+    fn registered_buffers_widen_the_search() {
+        // High above anything a test maps; resource numbers no live
+        // resource has.
+        let base = 0x7f00_0000_0000;
+        let len = 512 * MIB;
+        register(1, base, len);
+        for i in 0..100u64 {
+            register(2 + i as usize, base + i * 0x1000, 0x1000);
+        }
+        assert!(MAX_SPAN.load(Ordering::Relaxed) >= len);
+        let at = base + len - 64;
+        let found = enclosing(&buffers(), MAX_SPAN.load(Ordering::Relaxed), at, at + 64);
+        for i in 0..100u64 {
+            unregister(2 + i as usize, base + i * 0x1000);
+        }
+        unregister(1, base);
+        assert_eq!(found, Some((base, 1)));
+        assert!(buffers().range((base, 0)..=(base + len, usize::MAX)).next().is_none());
+    }
+
+    #[test]
+    fn loose_windows_are_reused_for_ranges_inside_them() {
+        let w = WINDOW;
+        let base = 0x20_0000_0000;
+        let mut windows = BTreeMap::new();
+        windows.insert((base, w), "first");
+        // A range across the next two windows got one of its own.
+        windows.insert((base + w, 2 * w), "spanning");
+        let span = 2 * w;
+        let find = |address: u64, len: u64| enclosing_window(&windows, span, address, address + len).copied();
+        assert_eq!(find(base, 1), Some("first"));
+        assert_eq!(find(base + w - 16, 16), Some("first"));
+        // Inside the spanning window, also in its second half.
+        assert_eq!(find(base + w + 8, 64), Some("spanning"));
+        assert_eq!(find(base + 2 * w + 8, 64), Some("spanning"));
+        assert_eq!(find(base + 3 * w - 8, 8), Some("spanning"));
+        // Across the first window's end: none holds it whole.
+        assert_eq!(find(base + w - 8, 16), None);
+        // Past every window, before them, longer than any.
+        assert_eq!(find(base + 3 * w, 1), None);
+        assert_eq!(find(base - 8, 4), None);
+        assert_eq!(find(base, 3 * w), None);
+    }
+
+    #[test]
+    fn loose_memory_must_be_committed() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        // The null page and its guard area.
+        assert!(loose(0, 16).is_none());
+        assert!(loose(0x1000, 0x1010).is_none());
+        assert!(loose(LOWEST_MAPPED - 1, LOWEST_MAPPED + 1).is_none());
+        // Reserved, not committed.
+        // SAFETY: a fresh reservation, released below.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), WINDOW as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
+        assert_ne!(p, 0);
+        assert!(loose(p + 64, p + 128).is_none());
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        // Too close to the top to round up to a window.
+        assert!(loose(u64::MAX - 8, u64::MAX).is_none());
+    }
+
+    /// The committed part around a range, of one allocation, cut to 64 KiB.
+    #[test]
+    fn the_committed_part_of_a_window_holds_the_range_or_is_none() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const K: u64 = 64 << 10;
+        // SAFETY: our own reservation; the middle 4 x 64 KiB committed.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), (8 * K) as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0);
+        // SAFETY: committing pages of our own reservation.
+        unsafe { VirtualAlloc((base + 2 * K) as *const _, (4 * K) as usize, MEM_COMMIT, PAGE_READWRITE) };
+        // A range in the committed middle: the committed part of the window.
+        assert_eq!(committed_part(base, 8 * K, base + 3 * K + 8, base + 3 * K + 16), Some((base + 2 * K, 4 * K)));
+        // Cut to the window.
+        assert_eq!(committed_part(base + 3 * K, K, base + 3 * K + 8, base + 3 * K + 16), Some((base + 3 * K, K)));
+        // A range reaching into reserved memory: none.
+        assert_eq!(committed_part(base, 8 * K, base + 6 * K - 8, base + 6 * K + 8), None);
+        assert_eq!(committed_part(base, 8 * K, base + 8, base + 16), None);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Memory of one committed allocation becomes a host buffer in place:
+    /// what the CPU wrote there is what the buffer holds.
+    #[test]
+    fn committed_memory_opens_as_a_buffer_in_place() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        if host().is_none() {
+            return;
+        }
+        const LEN: u64 = 1 << 20;
+        // SAFETY: our own allocation.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), LEN as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0);
+        touch(base as usize, LEN as usize);
+        // SAFETY: our memory.
+        unsafe { *((base + (64 << 10)) as *mut u32) = 0x1234_5678 };
+        let Some((buffer, gpu)) = in_place_buffer(base + (64 << 10), 128 << 10) else {
+            // A host that cannot open process memory as a heap: copies stay.
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+            return;
+        };
+        assert_ne!(gpu, 0);
+        // SAFETY: a plain query on a live buffer.
+        assert_eq!(unsafe { buffer.GetDesc() }.Width, 128 << 10);
+        // Off 64 KiB: refused.
+        assert!(in_place_buffer(base + 4096, 64 << 10).is_none());
+        drop(buffer);
+        let_go_in_place(base, LEN);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+
+    /// A heap opened over an allocation that is released and made again
+    /// with another size is not handed out again.
+    #[test]
+    fn a_heap_over_a_released_allocation_is_let_go() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _whole = WholeAllocations::on();
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        if host().is_none() {
+            return;
+        }
+        // SAFETY: our own allocation.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 1 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        assert_eq!(allocation_extent(base), Some(1 << 20));
+        touch(base, 1 << 20);
+        if in_place_buffer(base as u64, 64 << 10).is_none() {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+            return; // no heaps from process memory on this host
+        }
+        // SAFETY: our allocation.
+        let freed = unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) } != 0;
+        if !freed || allocation_extent(base).is_some() {
+            // Windows keeps memory a heap was opened over until the heap
+            // goes (Wine releases it at once): let go of it, then release.
+            let_go_in_place(base as u64, 1 << 20);
+            // SAFETY: our allocation.
+            assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0, "released once the heap is let go");
+        }
+        assert_eq!(allocation_extent(base), None);
+        // SAFETY: a new allocation, at that address if it is free.
+        let again = unsafe { VirtualAlloc(base as *const _, 2 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        if again == base {
+            touch(again, 2 << 20);
+            let (buffer, _) = in_place_buffer(base as u64, 2 << 20).expect("a heap over the new allocation");
+            // SAFETY: a plain query on a live buffer.
+            assert_eq!(unsafe { buffer.GetDesc() }.Width, 2 << 20, "placed in the new, larger heap");
+            drop(buffer);
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(again as *mut _, 0, MEM_RELEASE) };
+        }
+        let_go_in_place(base as u64, 2 << 20);
+    }
+
+
+    /// A stale heap found while a caller holds `LOOSE` and `BUFFERS` (as
+    /// `loose` and `find` do) does not take those locks again.
+    #[test]
+    fn a_stale_heap_is_replaced_under_the_callers_locks() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _whole = WholeAllocations::on();
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        if host().is_none() {
+            return;
+        }
+        // SAFETY: our own allocation.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 1 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        touch(base, 1 << 20);
+        if in_place_buffer(base as u64, 64 << 10).is_none() {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+            return; // no heaps from process memory on this host
+        }
+        // The cached heap no longer matches its allocation (as after the
+        // title released it and allocated again with another size). Made so
+        // in the cache itself: Windows does not change memory a heap was
+        // opened over while the heap lives.
+        if let Some(Some((_, size))) = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|h| h.get_mut(&base)) {
+            *size += 64 << 10;
+        }
+        {
+            let _loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            let _buffers = buffers();
+            // Would wait on the locks above forever if it let go of what is
+            // placed in the heap here.
+            let _ = in_place_buffer(base as u64, 64 << 10);
+        }
+        assert!(STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(b, _)| b == base));
+        check_in_place();
+        assert!(STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).is_empty(), "let go at the frame's check");
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+
+    /// The in-place tests share the heap cache and the queue of stale heaps
+    /// (and may get each other's addresses back): one at a time.
+    static IN_PLACE_TESTS: Mutex<()> = Mutex::new(());
+
+    /// Writes every page of `[base, base + len)`, so the allocation counts as
+    /// dense ([`dense`]).
+    fn touch(base: usize, len: usize) {
+        for page in (0..len).step_by(4096) {
+            // SAFETY: committed memory of the test's own allocation.
+            unsafe { ((base + page) as *mut u8).write_volatile(1) };
+        }
+    }
+
+    /// Takes the whole-allocation path for the life of the guard.
+    struct WholeAllocations;
+    impl WholeAllocations {
+        fn on() -> Self {
+            // Decisions of earlier tests may name an address given out again.
+            *DECIDED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            WHOLE_ALLOCATIONS_ONLY.store(true, Ordering::Relaxed);
+            WholeAllocations
+        }
+    }
+    impl Drop for WholeAllocations {
+        fn drop(&mut self) {
+            WHOLE_ALLOCATIONS_ONLY.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// A sparse allocation (committed, mostly never touched) is not opened
+    /// whole: that would make all of it resident.
+    #[test]
+    fn a_sparse_allocation_is_not_opened_whole() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _whole = WholeAllocations::on();
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        if host().is_none() {
+            return;
+        }
+        const LEN: usize = 16 << 20;
+        // SAFETY: our own allocation.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        touch(base, 64 << 10);
+        assert!(
+            in_place_buffer(base as u64, 64 << 10).is_none(),
+            "1 of 256 pieces touched"
+        );
+        assert!(
+            IN_PLACE_HEAPS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_none_or(|h| !h.contains_key(&base))
+        );
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Where the host opens sub-ranges, a buffer in place is a heap over its
+    /// own pages only, also in a sparse allocation, and no whole-allocation
+    /// heap is kept.
+    #[test]
+    fn a_sub_range_heap_covers_only_the_buffer() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::Win32::Graphics::Direct3D12::ID3D12Device13;
+        use windows::core::Interface;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let Some(host) = host() else { return };
+        if host.device.cast::<ID3D12Device13>().is_err() {
+            return; // no sub-range heaps on this host (vkd3d-proton)
+        }
+        const LEN: usize = 16 << 20;
+        // SAFETY: our own allocation.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        let Some((buffer, gpu)) = in_place_buffer((base + (1 << 20)) as u64, 128 << 10) else {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+            return; // the host refuses process memory as a heap
+        };
+        assert_ne!(gpu, 0);
+        // SAFETY: a plain query on a live buffer.
+        assert_eq!(unsafe { buffer.GetDesc() }.Width, 128 << 10);
+        assert!(
+            IN_PLACE_HEAPS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_none_or(|h| !h.contains_key(&base))
+        );
+        drop(buffer);
+        // SAFETY: our allocation; the heap went with the buffer.
+        assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);
     }
 }

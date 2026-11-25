@@ -545,6 +545,7 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::shadow::in_place_remapped(at as u64, len as u64);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.

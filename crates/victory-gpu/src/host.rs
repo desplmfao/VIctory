@@ -2343,6 +2343,7 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
         crate::memory::log_frame();
+        crate::shadow::check_in_place();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
         #[cfg(feature = "diagnostics")]
