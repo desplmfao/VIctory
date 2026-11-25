@@ -366,14 +366,15 @@ struct Slot {
     latch: Latch,
 }
 
-/// Whether presses are latched: only with `VICTORY_INPUT_LATCH=1`. Off by
-/// default, since it departs from what the real `GetCurrentReading` returns.
+/// Whether presses are latched: on unless `VICTORY_INPUT_LATCH=0`. (This
+/// fork turns it on by default: at the frame rates the title runs at here,
+/// taps are lost without it. Upstream #2230 has it off by default.)
 fn latch_enabled() -> bool {
     latch_asked(std::env::var_os("VICTORY_INPUT_LATCH").as_deref())
 }
 
 fn latch_asked(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_some_and(|v| v == "1")
+    !value.is_some_and(|v| v == "0")
 }
 
 /// A title that reads only the current state once per frame misses a tap
@@ -1577,9 +1578,9 @@ mod tests {
 
     #[test]
     fn the_latch_is_off_unless_asked_for() {
-        assert!(!latch_asked(None));
+        assert!(latch_asked(None));
         assert!(!latch_asked(Some("0".as_ref())));
-        assert!(!latch_asked(Some("".as_ref())));
+        assert!(latch_asked(Some("".as_ref())));
         assert!(latch_asked(Some("1".as_ref())));
     }
 

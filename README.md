@@ -87,6 +87,7 @@ easier to read at 1–2 fps.
 | [#2112](https://github.com/Marvisak/VIctory/pull/2112) | desplmfao | Opt-in (`VICTORY_IN_PLACE=1`): title memory read in place instead of copied; on vkd3d-proton only allocations already 90% resident (opening one pins all of it) |
 | [#2162](https://github.com/Marvisak/VIctory/pull/2162) | desplmfao | Depth twins share their scratch buffers (about 280 MB video memory) |
 | [#2389](https://github.com/Marvisak/VIctory/pull/2389) | desplmfao (fxceless's mechanism, 507KAZ's tip) | Opt-in `VICTORY_LEVELS_ON_DEMAND=1`: streamed textures take video memory only for the levels the title holds (about 5 GB less) |
+| [#2230](https://github.com/Marvisak/VIctory/pull/2230) | desplmfao | Taps between two frames are not lost (input at low frame rates). **On by default in this fork**; `VICTORY_INPUT_LATCH=0` turns it off |
 | [#2218](https://github.com/Marvisak/VIctory/pull/2218) | desplmfao (from youroot-code's fxceless/victory-fork#23) | GameInput keeps 256 readings per device, not 32 (input read through the history is not lost at low frame rates) |
 | [#439](https://github.com/Marvisak/VIctory/pull/439) (with #233, #320) | r4tedx | Wave64 compute on 32-lane GPUs (NVIDIA): one console wave runs in the console flow |
 | [#2309](https://github.com/Marvisak/VIctory/pull/2309) | powplusplus ([#1885](https://github.com/Marvisak/VIctory/pull/1885), one commit), desplmfao | One back edge per loop header and per block, so vkd3d-proton's dxil-spirv converts #439's loops instead of recursing until the process dies |
