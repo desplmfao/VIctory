@@ -38,6 +38,7 @@ indirect draw.
 | [#2071](https://github.com/Marvisak/VIctory/pull/2071) | 0xkn0wh3r3 | Frees the executable's bytes once loaded (228 MB) |
 | [#2088](https://github.com/Marvisak/VIctory/pull/2088) | kxiserino ([#402](https://github.com/Marvisak/VIctory/pull/402)), desplmfao | Reuses loose windows that hold a range; 256 KiB windows instead of 4 MiB |
 | [#2162](https://github.com/Marvisak/VIctory/pull/2162) | desplmfao | Depth twins share their scratch buffers (about 280 MB video memory) |
+| [#2389](https://github.com/Marvisak/VIctory/pull/2389) | desplmfao (fxceless's mechanism, 507KAZ's tip) | Opt-in `VICTORY_LEVELS_ON_DEMAND=1`: streamed textures take video memory only for the levels the title holds (about 5 GB less) |
 | [#2218](https://github.com/Marvisak/VIctory/pull/2218) | desplmfao (from youroot-code's fxceless/victory-fork#23) | GameInput keeps 256 readings per device, not 32 (input read through the history is not lost at low frame rates) |
 
 Running under Proton is much faster with the wineserver patch from
