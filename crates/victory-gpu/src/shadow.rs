@@ -51,6 +51,9 @@ pub(crate) struct Shadow {
     /// buffer placed in a heap opened over the title's allocation, so there
     /// is nothing to copy either way.
     in_place: bool,
+    /// In place: the heap it is placed in ([`HeapId`]), which tells it
+    /// apart from buffers placed in a heap opened later at the same address.
+    heap: Option<HeapId>,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -182,6 +185,7 @@ impl Shadow {
     // "copied" mark and is compared without the title-write check.
     pub(crate) fn copy_back_page(&self, page: usize) -> usize {
         if self.in_place {
+            self.landed(page, PAGE);
             return 0;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -223,17 +227,29 @@ impl Shadow {
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         if self.in_place {
+            self.keep_in_place(list);
             return;
         }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
 
-    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
-        Self::new_with(buffer, data, gpu, start, len, false)
+    /// An in-place buffer has nothing to bring up to date, but `list`'s
+    /// commands name its GPU address: the list keeps the placed buffer (and
+    /// so its heap, which a placed resource holds) until it is reset, for
+    /// the title may release the buffer, or the heap be let go, before the
+    /// list runs.
+    fn keep_in_place(&self, list: &HostList) {
+        // By the buffer: kept, its address is not given out again meanwhile.
+        list.keep_once(windows::core::Interface::as_raw(&self.buffer) as usize, &self.buffer);
     }
 
-    fn new_with(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, in_place: bool) -> Arc<Shadow> {
+    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
+        Self::new_with(buffer, data, gpu, start, len, None)
+    }
+
+    fn new_with(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, heap: Option<HeapId>) -> Arc<Shadow> {
+        let in_place = heap.is_some();
         let tracked = if in_place { None } else { crate::watch::track(start as usize, len as usize, true) };
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
@@ -247,6 +263,7 @@ impl Shadow {
             before: Mutex::default(),
             marks,
             in_place,
+            heap,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -263,6 +280,11 @@ impl Shadow {
         let base = self.marks?;
         let page = (start >> 16).checked_sub(self.start >> 16)?;
         Some((base + u32::try_from(page).ok()?, (start & 0xFFFF) as u32))
+    }
+
+    /// Whether this is title memory itself (`VICTORY_IN_PLACE`), not a copy.
+    pub(crate) fn in_place(&self) -> bool {
+        self.in_place
     }
 
     /// Whether writes through views of this copy are marked.
@@ -292,6 +314,7 @@ impl Shadow {
     /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         if self.in_place {
+            self.keep_in_place(list);
             return;
         }
         let len = len.min(self.left(address));
@@ -359,6 +382,20 @@ impl Shadow {
         segments.insert(first, (start, grown));
     }
 
+    /// After the submission ran, for a buffer in place: its shaders may have
+    /// written `[address, address + len)` of title memory directly, which
+    /// no guard or write watch sees. Other copies holding those pages (a
+    /// title buffer under the in-place floor, a view's own copy, a texture)
+    /// would keep their older bytes: the pages are marked changed, as a
+    /// copy-back marks the pages it writes.
+    pub(crate) fn landed(&self, address: usize, len: usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if self.in_place && from < to {
+            drop(crate::watch::writing(from, to - from));
+        }
+    }
+
     /// After the submission ran: copies the bytes its shaders wrote back
     /// into title memory (unmapped pages left alone), and only those: the
     /// title's threads write the same buffers while the GPU runs (its
@@ -368,6 +405,7 @@ impl Shadow {
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
         if self.in_place {
+            self.landed(address, len);
             return 0;
         }
         self.copy_back_or_not(address, len, true)
@@ -378,6 +416,8 @@ impl Shadow {
     /// from memory with no copy, `crate::memory`).
     pub(crate) fn keep_writes(&self, address: usize, len: usize) {
         if self.in_place {
+            // Written into title memory already: nothing can keep them out.
+            self.landed(address, len);
             return;
         }
         self.copy_back_or_not(address, len, false);
@@ -972,7 +1012,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return loose(address, end);
     };
     let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() && in_place_enabled() {
+    if entry.shadow.is_none() && in_place_enabled() && entry.end - key.0 >= in_place_min() {
         // In place: from the 64 KiB boundary at or below the buffer (views
         // find their bytes by address, `Shadow::offset`), past its end by the
         // 256 bytes a view ending in its last bytes reads where the
@@ -984,10 +1024,10 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
             committed_part(lo, hi - lo, key.0, end)
         });
         if let Some((s0, l0)) = part
-            && let Some((buffer, gpu)) = in_place_buffer(s0, l0)
+            && let Some((buffer, gpu, heap)) = in_place_buffer(s0, l0)
         {
             crate::host::name(&buffer, || format!("title buffer in place {:#x}+{:#x}", key.0, entry.end - key.0));
-            entry.shadow = Some(Shadow::new_with(buffer, s0 as *mut u8, gpu, s0, l0, true));
+            entry.shadow = Some(Shadow::new_with(buffer, s0 as *mut u8, gpu, s0, l0, Some(heap)));
             changed();
         }
     }
@@ -1027,9 +1067,19 @@ fn in_place_enabled() -> bool {
 }
 
 
-/// A heap opened over a title allocation and its size; `None` if it could
-/// not be opened.
-type OpenedHeap = Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>;
+/// A heap opened over a title allocation, its size and its id; `None` if
+/// it could not be opened.
+type OpenedHeap = Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64, HeapId)>;
+
+/// Tells apart heaps opened over title memory, also two opened over one
+/// allocation base (the title released the allocation and made another
+/// there): what is let go of a stale heap is only what was placed in it.
+type HeapId = u64;
+
+fn next_heap_id() -> HeapId {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Host heaps opened over title allocations, by allocation base.
 static IN_PLACE_HEAPS: Mutex<Option<std::collections::HashMap<usize, OpenedHeap>>> = Mutex::new(None);
@@ -1053,6 +1103,17 @@ fn allocation_extent(base: usize) -> Option<u64> {
         }
         at = info.BaseAddress as usize + info.RegionSize;
     }
+}
+
+/// The smallest title buffer that goes in place (`VICTORY_IN_PLACE_MIN_KB`,
+/// 1024 by default). Smaller ones keep their copies: shaders' atomics and
+/// small reads of host memory cross the bus each time, and a once-a-frame
+/// compute pass over a tiny buffer in host memory took 19–67 ms of GPU time
+/// instead of 1–6 ms (measured by sirrus98 on an RTX 4090 for the in-place
+/// work of fxceless/victory-fork#772, which keeps the same floor).
+fn in_place_min() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| std::env::var("VICTORY_IN_PLACE_MIN_KB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1024) << 10)
 }
 
 /// The share of an allocation's pages that must already be in memory
@@ -1137,34 +1198,59 @@ fn dense(base: usize, size: Option<u64>) -> bool {
 
 /// Once a frame: heaps opened over allocations the title has released or
 /// changed since (another size, or not all committed) are let go with the
-/// in-place windows and title buffers over them, as on a remap. The title
+/// in-place windows and title buffers placed in them (by heap id). The title
 /// frees some of its memory itself, unseen by us; what this cannot tell is
 /// an allocation released and made again at the same address and size.
 pub(crate) fn check_in_place() {
     let pending = std::mem::take(&mut *STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()));
-    for (base, size) in pending {
-        let_go_in_place(base as u64, size);
+    for id in pending {
+        let_go_heap(id);
     }
     if !in_place_enabled() {
         return;
     }
-    let stale: Vec<(usize, u64)> = {
+    let stale: Vec<HeapId> = {
         let heaps = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps
             .iter()
             .flat_map(|h| h.iter())
-            .filter_map(|(&base, v)| v.as_ref().map(|(_, size)| (base, *size)))
-            .filter(|&(base, size)| allocation_extent(base) != Some(size))
+            .filter_map(|(&base, v)| v.as_ref().map(|(_, size, id)| (base, *size, *id)))
+            .filter(|&(base, size, _)| allocation_extent(base) != Some(size))
+            .map(|(_, _, id)| id)
             .collect()
     };
-    for (base, size) in stale {
-        let_go_in_place(base as u64, size);
+    for id in stale {
+        let_go_heap(id);
     }
 }
 
 /// Heaps found stale while a caller held `BUFFERS` or `LOOSE`: what is placed
-/// in them is let go at the next frame's check.
-static STALE_IN_PLACE: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+/// in them is let go at the next frame's check. By id: by then a new heap
+/// may be open at the same base, with buffers placed in it.
+static STALE_IN_PLACE: Mutex<Vec<HeapId>> = Mutex::new(Vec::new());
+
+/// Lets go of heap `id` (if still cached) and the in-place windows and
+/// title buffers placed in it, and of nothing else: not of a heap opened
+/// later over the same memory, nor of what is placed in that one.
+fn let_go_heap(id: HeapId) {
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let before = map.len();
+    map.retain(|_, sh| sh.heap != Some(id));
+    let mut gone = before - map.len();
+    drop(map);
+    for e in buffers().values_mut() {
+        if e.shadow.as_ref().is_some_and(|sh| sh.heap == Some(id)) {
+            e.shadow = None;
+            gone += 1;
+        }
+    }
+    if let Some(h) = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        h.retain(|_, v| v.as_ref().is_none_or(|(_, _, i)| *i != id));
+    }
+    if gone > 0 {
+        changed();
+    }
+}
 
 /// Title memory `[at, at + len)` was mapped or unmapped: in-place windows
 /// and title buffers over it, and heaps opened over allocations it touches show the old pages
@@ -1193,7 +1279,7 @@ fn let_go_in_place(at: u64, len: u64) {
     let mut heaps = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(h) = heaps.as_mut() {
         h.retain(|&base, v| match v {
-            Some((_, size)) => !((base as u64) < end && at < base as u64 + *size),
+            Some((_, size, _)) => !((base as u64) < end && at < base as u64 + *size),
             None => true,
         });
     }
@@ -1245,12 +1331,20 @@ fn committed_part(start: u64, len: u64, address: u64, end: u64) -> Option<(u64, 
 /// A host buffer that is the title memory `[start, start + len)` itself:
 /// placed at its offset in a heap opened over the allocation holding it.
 /// `None` where that cannot be (not one committed allocation, the heap
-/// refused, a placement off 64 KiB).
-fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
+/// refused, a placement off 64 KiB). With the id of the heap it is placed in.
+fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64, HeapId)> {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::core::Interface;
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    let refuse = |_why: &str| None;
+    let refuse = |why: &'static str| {
+        #[cfg(feature = "diagnostics")]
+        {
+            let mut r = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+            *r.entry(why).or_insert(0) += 1;
+        }
+        let _ = why;
+        None
+    };
     // The whole range committed, in one allocation.
     let mut base = 0usize;
     let mut at = start as usize;
@@ -1285,7 +1379,10 @@ fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
         // a 64 KiB boundary of it.
         let opened = unsafe { dev13.OpenExistingHeapFromAddress1::<ID3D12Heap>(start as *const _, size) };
         if let Ok(heap) = opened {
-            return place_in(&host.device, &heap, 0, len).or_else(|| refuse("placement refused"));
+            let id = next_heap_id();
+            return place_in(&host.device, &heap, 0, len)
+                .map(|(buffer, gpu)| (buffer, gpu, id))
+                .or_else(|| refuse("placement refused"));
         }
     }
     // A heap opened earlier over an allocation the title has released or
@@ -1296,18 +1393,18 @@ fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
         heaps
             .as_ref()
             .and_then(|h| h.get(&base))
-            .and_then(|v| v.as_ref().map(|(_, size)| *size))
-            .filter(|&size| extent != Some(size))
+            .and_then(|v| v.as_ref().map(|(_, size, id)| (*size, *id)))
+            .filter(|&(size, _)| extent != Some(size))
     };
     // Only the heap goes here: the callers hold `BUFFERS` or `LOOSE`, which
     // letting go of what is placed in it takes, so that waits for the next
     // frame's check ([`check_in_place`]), outside those locks.
     let mut heaps = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(size) = stale {
+    if let Some((_, id)) = stale {
         if let Some(h) = heaps.as_mut() {
             h.remove(&base);
         }
-        STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).push((base, size));
+        STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).push(id);
     }
     if !heaps.as_ref().is_some_and(|h| h.contains_key(&base)) && !dense(base, extent) {
         return refuse("sparse");
@@ -1319,16 +1416,18 @@ fn in_place_buffer(start: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
         // SAFETY: a plain query.
         let size = unsafe { heap.GetDesc() }.SizeInBytes;
         tracing::debug!(base = format_args!("{base:#x}"), size, "title allocation opened as a host heap");
-        Some((heap, size))
+        Some((heap, size, next_heap_id()))
     });
-    let Some((heap, size)) = heap.clone() else {
+    let Some((heap, size, id)) = heap.clone() else {
         return refuse("heap refused");
     };
     drop(heaps);
     if offset + len > size {
         return refuse("past the heap");
     }
-    place_in(&host.device, &heap, offset, len).or_else(|| refuse("placement refused"))
+    place_in(&host.device, &heap, offset, len)
+        .map(|(buffer, gpu)| (buffer, gpu, id))
+        .or_else(|| refuse("placement refused"))
 }
 
 /// Tests of the whole-allocation path (the heap cache, stale heaps) turn
@@ -1436,10 +1535,10 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     }
     if in_place_enabled()
         && let Some((s0, l0)) = committed_part(start, len, address, end)
-        && let Some((buffer, gpu)) = in_place_buffer(s0, l0)
+        && let Some((buffer, gpu, heap)) = in_place_buffer(s0, l0)
     {
         crate::host::name(&buffer, || format!("title memory in place {s0:#x}+{l0:#x}"));
-        let shadow = Shadow::new_with(buffer, s0 as *mut u8, gpu, s0, l0, true);
+        let shadow = Shadow::new_with(buffer, s0 as *mut u8, gpu, s0, l0, Some(heap));
         LOOSE_SPAN.fetch_max(l0, Ordering::Relaxed);
         map.insert((s0, l0), shadow.clone());
         changed();
@@ -1486,10 +1585,19 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shad
 #[cfg(feature = "diagnostics")]
 static VIEWS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// Logs [`VIEWS`] per frame over `frames`.
+/// Why title memory stayed copied instead of going in place, by reason
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+static REFUSED: Mutex<std::collections::BTreeMap<&'static str, u64>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Logs [`VIEWS`] per frame over `frames`, and why ranges stayed copied.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log_views(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
+    let refused = std::mem::take(&mut *REFUSED.lock().unwrap_or_else(|e| e.into_inner()));
+    if !refused.is_empty() {
+        tracing::info!(?refused, "title memory kept as a copy, not in place (since the line before)");
+    }
     let [asks, made, bytes, largest] = [0, 1, 2, 3].map(|i| VIEWS[i].swap(0, Relaxed));
     let live = EXACT
         .lock()
@@ -1957,7 +2065,7 @@ mod tests {
         touch(base as usize, LEN as usize);
         // SAFETY: our memory.
         unsafe { *((base + (64 << 10)) as *mut u32) = 0x1234_5678 };
-        let Some((buffer, gpu)) = in_place_buffer(base + (64 << 10), 128 << 10) else {
+        let Some((buffer, gpu, _)) = in_place_buffer(base + (64 << 10), 128 << 10) else {
             // A host that cannot open process memory as a heap: copies stay.
             // SAFETY: our allocation.
             unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
@@ -2009,7 +2117,7 @@ mod tests {
         let again = unsafe { VirtualAlloc(base as *const _, 2 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
         if again == base {
             touch(again, 2 << 20);
-            let (buffer, _) = in_place_buffer(base as u64, 2 << 20).expect("a heap over the new allocation");
+            let (buffer, _, _) = in_place_buffer(base as u64, 2 << 20).expect("a heap over the new allocation");
             // SAFETY: a plain query on a live buffer.
             assert_eq!(unsafe { buffer.GetDesc() }.Width, 2 << 20, "placed in the new, larger heap");
             drop(buffer);
@@ -2043,8 +2151,10 @@ mod tests {
         // title released it and allocated again with another size). Made so
         // in the cache itself: Windows does not change memory a heap was
         // opened over while the heap lives.
-        if let Some(Some((_, size))) = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|h| h.get_mut(&base)) {
+        let mut stale = 0;
+        if let Some(Some((_, size, id))) = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|h| h.get_mut(&base)) {
             *size += 64 << 10;
+            stale = *id;
         }
         {
             let _loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
@@ -2053,11 +2163,156 @@ mod tests {
             // placed in the heap here.
             let _ = in_place_buffer(base as u64, 64 << 10);
         }
-        assert!(STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(b, _)| b == base));
+        assert!(STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).contains(&stale));
         check_in_place();
         assert!(STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).is_empty(), "let go at the frame's check");
+        // The heap opened in place of the stale one stays cached (only the
+        // stale one is let go): let go of it before the memory, or a later
+        // test given this address finds it.
+        let_go_in_place(base as u64, 1 << 20);
         // SAFETY: our allocation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+
+    /// A stale heap replaced by a new one at the same base is let go at the
+    /// frame's check with what was placed in it, and nothing of the new
+    /// heap: not the heap, nor the windows placed in it.
+    #[test]
+    fn stale_queue_does_not_evict_replacement_heap_at_same_base() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let _whole = WholeAllocations::on();
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        if host().is_none() {
+            return;
+        }
+        // SAFETY: our own allocation.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 1 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        touch(base, 1 << 20);
+        let place = |len: u64| {
+            let (buffer, gpu, heap) = in_place_buffer(base as u64, len)?;
+            let shadow = Shadow::new_with(buffer, base as *mut u8, gpu, base as u64, len, Some(heap));
+            LOOSE.lock().unwrap_or_else(|e| e.into_inner()).insert((base as u64, len), shadow);
+            Some(heap)
+        };
+        let Some(old) = place(64 << 10) else {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+            return; // no heaps from process memory on this host
+        };
+        // The cached heap no longer matches its allocation (as after the
+        // title released it and made another of a new size there).
+        if let Some(Some((_, size, _))) = IN_PLACE_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|h| h.get_mut(&base)) {
+            *size += 64 << 10;
+        }
+        let new = place(128 << 10).expect("a new heap at the same base");
+        assert_ne!(new, old);
+        assert!(STALE_IN_PLACE.lock().unwrap_or_else(|e| e.into_inner()).contains(&old));
+        check_in_place();
+        let (old_gone, survived) = {
+            let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                !loose.contains_key(&(base as u64, 64 << 10)),
+                loose.get(&(base as u64, 128 << 10)).is_some_and(|s| s.heap == Some(new)),
+            )
+        };
+        let cached = IN_PLACE_HEAPS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|h| h.get(&base).cloned())
+            .flatten()
+            .map(|(_, _, id)| id);
+        let_go_in_place(base as u64, 1 << 20);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        assert!(old_gone, "the window in the stale heap is let go");
+        assert!(survived, "the window in the new heap stays");
+        assert_eq!(cached, Some(new), "the new heap stays cached");
+    }
+
+
+    /// A list that uses an in-place buffer keeps it (and so its heap) until
+    /// it is reset, though nothing is refreshed: the title may release the
+    /// buffer, or its heap be let go, before the list runs.
+    #[test]
+    fn a_list_keeps_the_in_place_buffers_it_uses() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::core::{IUnknown, Interface};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        let Some(host) = host() else { return };
+        // SAFETY: our own allocation.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 1 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        touch(base, 1 << 20);
+        let Some((buffer, gpu, heap)) = in_place_buffer(base as u64, 64 << 10) else {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+            return; // no heaps from process memory on this host
+        };
+        let seen = buffer.clone();
+        // References to the buffer (besides the one asking).
+        let refs = || {
+            let u: IUnknown = seen.cast().unwrap();
+            let vtable = u.vtable();
+            // SAFETY: a live object; one reference added and taken back.
+            unsafe {
+                (vtable.AddRef)(u.as_raw());
+                (vtable.Release)(u.as_raw()) - 1
+            }
+        };
+        let shadow = Shadow::new_with(buffer, base as *mut u8, gpu, base as u64, 64 << 10, Some(heap));
+        let list = host.new_list().unwrap();
+        let before = refs();
+        shadow.refresh(&list, base as u64, 256);
+        shadow.refresh(&list, base as u64 + 256, 256);
+        shadow.gpu_writes(&list, base as u64, 4096, false);
+        assert_eq!(refs(), before + 1, "kept once by the list");
+        drop(shadow);
+        assert_eq!(refs(), before, "the list holds it after the copy is gone");
+        list.close();
+        list.reset();
+        assert_eq!(refs(), before - 1, "let go when the list is reset");
+        drop(seen);
+        let_go_in_place(base as u64, 1 << 20);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+
+    /// What shaders wrote through a buffer in place went into title memory
+    /// unseen by the guards: other copies holding the page see it changed,
+    /// as after a copy-back.
+    #[test]
+    fn writes_in_place_mark_other_copies_of_the_page_changed() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::watch::tests::{free, pool};
+        if host().is_none() {
+            return;
+        }
+        let p = pool(2);
+        touch(p, 2 * PAGE);
+        let Some((buffer, gpu, heap)) = in_place_buffer(p as u64, PAGE as u64) else {
+            free(p);
+            return; // no heaps from process memory on this host
+        };
+        let in_place = Shadow::new_with(buffer, p as *mut u8, gpu, p as u64, PAGE as u64, Some(heap));
+        let other = crate::watch::track(p, 2 * PAGE, true).expect("pool memory is tracked");
+        other.take(p, p + 2 * PAGE);
+        // Windows does not guard memory a heap was opened over: such a page
+        // stays changed, so copies of it are always copied again.
+        let guarded = !other.changed(p / PAGE);
+        in_place.copy_back(p + 8, 4);
+        let marked = other.changed(p / PAGE);
+        let beside = other.changed(p / PAGE + 1);
+        drop((other, in_place));
+        let_go_in_place(p as u64, 2 * PAGE as u64);
+        free(p);
+        if guarded {
+            assert!(marked, "the page written in place is changed for other copies");
+            assert!(!beside, "and only that page");
+        }
     }
 
 
@@ -2155,7 +2410,17 @@ mod tests {
             )
         } as usize;
         assert_ne!(base, 0);
-        let Some((buffer, gpu)) = in_place_buffer((base + (1 << 20)) as u64, 128 << 10) else {
+        // What the cache holds at this base (left by a test that had the
+        // address before, if anything): the sub-range path adds nothing.
+        let cached = || {
+            IN_PLACE_HEAPS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|h| h.get(&base).map(|v| v.as_ref().map(|(_, _, id)| *id)))
+        };
+        let before = cached();
+        let Some((buffer, gpu, _)) = in_place_buffer((base + (1 << 20)) as u64, 128 << 10) else {
             // SAFETY: our allocation.
             unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
             return; // the host refuses process memory as a heap
@@ -2163,13 +2428,7 @@ mod tests {
         assert_ne!(gpu, 0);
         // SAFETY: a plain query on a live buffer.
         assert_eq!(unsafe { buffer.GetDesc() }.Width, 128 << 10);
-        assert!(
-            IN_PLACE_HEAPS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .is_none_or(|h| !h.contains_key(&base))
-        );
+        assert_eq!(cached(), before, "no whole-allocation heap opened");
         drop(buffer);
         // SAFETY: our allocation; the heap went with the buffer.
         assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);

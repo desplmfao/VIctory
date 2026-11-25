@@ -504,6 +504,10 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Where its indirect executions clamp records copied out of title
+    /// memory (`crate::indirect::copied`), its size and whether it was
+    /// used yet (between uses it is in the unordered-access state).
+    arguments: Mutex<Option<(ID3D12Resource, u64, bool)>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -708,6 +712,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Keys of what [`HostList::keep_once`] kept.
+    kept_once: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -877,6 +883,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
+                arguments: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1941,6 +1948,26 @@ impl HostList {
         Some(result)
     }
 
+    /// A shader-writable buffer of the list's of at least `len` bytes for
+    /// indirect arguments (`crate::indirect::copied`), and whether this is
+    /// its first use (it is still in the common state). One buffer, reused
+    /// by each execution in turn; a bigger one replaces it when needed (the
+    /// list keeps the old one).
+    pub(crate) fn arguments(&self, len: u64) -> Option<(ID3D12Resource, bool)> {
+        let mut arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+        if arguments.as_ref().is_none_or(|a| a.1 < len) {
+            if let Some((old, _, _)) = arguments.take() {
+                self.keep(&old);
+            }
+            let size = len.max(1).checked_next_multiple_of(64 << 10)?;
+            let (buffer, _) = host()?.shared_buffer(size)?;
+            name(&buffer, || format!("list indirect arguments {size:#x}"));
+            *arguments = Some((buffer, size, false));
+        }
+        let (buffer, _, used) = arguments.as_mut()?;
+        Some((buffer.clone(), !std::mem::replace(used, true)))
+    }
+
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
@@ -1968,6 +1995,18 @@ impl HostList {
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
+        }
+    }
+
+    /// [`HostList::keep`], once per `key` until the list is reset (for
+    /// objects the list's commands name many times; `key` must not be given
+    /// to another object while this one is kept: its address, say).
+    pub(crate) fn keep_once(&self, key: usize, object: &impl Interface) {
+        let mut deferred = self.deferred();
+        if deferred.kept_once.insert(key)
+            && let Ok(object) = object.cast::<windows::core::IUnknown>()
+        {
+            deferred.kept.push(object);
         }
     }
 

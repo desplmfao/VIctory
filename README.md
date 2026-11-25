@@ -219,7 +219,10 @@ Where the host opens part of an allocation as a heap
 (`OpenExistingHeapFromAddress1`), only a buffer's own pages are opened.
 Elsewhere (vkd3d-proton) the whole allocation is opened, which makes all of
 it resident, so only allocations already mostly in memory go in place: 90%
-by default, `VICTORY_IN_PLACE_DENSITY` sets the percentage. Sparse
+by default, `VICTORY_IN_PLACE_DENSITY` sets the percentage. Title buffers
+under 1 MiB keep their copies (`VICTORY_IN_PLACE_MIN_KB`): shaders reach
+host memory over the bus, which costs most for small, often-touched
+buffers. Sparse
 allocations, and memory that is not one committed allocation (a buffer over
 many separately mapped pages, say), are still copied. Unset, nothing
 changes.
