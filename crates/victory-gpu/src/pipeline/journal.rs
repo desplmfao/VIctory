@@ -373,11 +373,17 @@ impl Journal {
         let mut st = self.gate.lock().unwrap_or_else(|e| e.into_inner());
         if alone {
             st.alone = false;
+            // The next suspect waiting gets its own `alone_for`.
+            st.since = (st.waiting_alone > 0).then(Instant::now);
         } else {
             st.shared -= 1;
+            // An ordinary pipeline returning does not restart the window:
+            // otherwise a suspect waiting behind a busy queue would hold
+            // every pipeline up for `alone_for` again at each return.
+            if !st.alone && st.waiting_alone == 0 {
+                st.since = None;
+            }
         }
-        // The next suspect waiting gets its own `alone_for`.
-        st.since = (st.alone || st.waiting_alone > 0).then(Instant::now);
         self.gate_changed.notify_all();
     }
 
@@ -746,6 +752,50 @@ mod tests {
         // Once it returned, nothing holds the gate.
         assert!(!j.held_alone());
         drop(j.enter("cccccccccccccccc", "").unwrap());
+    }
+
+    /// A suspect waiting while ordinary pipelines keep returning holds them
+    /// up once for `alone_for`, not again at each return.
+    #[test]
+    fn a_waiting_suspect_does_not_restart_its_window_as_others_return() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("suspects.txt"), "aaaaaaaaaaaaaaaa\n").unwrap();
+        let mut j = Journal::open(dir.path(), "t1", |_| false).unwrap();
+        j.alone_for = Duration::from_millis(300);
+        let j = &j;
+        std::thread::scope(|s| {
+            // Six ordinary pipelines are being created, each on its thread.
+            let mut busy = Vec::new();
+            for _ in 0..6 {
+                let (go, wait) = std::sync::mpsc::channel::<()>();
+                let (held, ready) = std::sync::mpsc::channel::<()>();
+                s.spawn(move || {
+                    let p = j.enter("bbbbbbbbbbbbbbbb", "").unwrap();
+                    held.send(()).unwrap();
+                    let _ = wait.recv();
+                    drop(p);
+                });
+                ready.recv().unwrap();
+                busy.push(go);
+            }
+            // The suspect waits for them.
+            let suspect = s.spawn(move || drop(j.enter("aaaaaaaaaaaaaaaa", "").unwrap()));
+            std::thread::sleep(Duration::from_millis(20));
+            // A new pipeline comes, and the six return one by one.
+            let started = Instant::now();
+            let new = s.spawn(move || {
+                drop(j.enter("cccccccccccccccc", "").unwrap());
+                started.elapsed()
+            });
+            for go in busy {
+                std::thread::sleep(Duration::from_millis(100));
+                let _ = go.send(());
+            }
+            let waited = new.join().unwrap();
+            assert!(waited < Duration::from_millis(500), "{waited:?}");
+            suspect.join().unwrap();
+        });
     }
 
     /// A pipeline made while this thread already holds the gate (a helper
