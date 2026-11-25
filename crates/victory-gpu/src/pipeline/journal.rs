@@ -18,6 +18,11 @@
 //!   whose creation returns leaves the list.
 //!
 //! A line deleted from `crashed.txt` lets that pipeline be tried again.
+//!
+//! With `VICTORY_PIPELINE_SOFT_CRASH`, a fault while creating a pipeline
+//! does not end the process (see `soft_crash`): the pipeline goes into
+//! `crashed.txt` at once, and is refused for the rest of the run even with
+//! the journal off.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -95,6 +100,22 @@ fn read_list(path: &Path) -> HashSet<String> {
         .collect()
 }
 
+/// Appends `key` to `crashed.txt`, below a comment of `detail` if any.
+fn add_crashed(path: &Path, key: &str, detail: &str) {
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(path);
+    match file {
+        Ok(mut f) => {
+            if !detail.is_empty() {
+                let _ = writeln!(f, "# {detail}");
+            }
+            let _ = writeln!(f, "{key}");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "crashed pipeline not saved")
+        }
+    }
+}
+
 fn write_list<'a>(path: &Path, keys: impl IntoIterator<Item = &'a String>) {
     let mut keys: Vec<&String> = keys.into_iter().collect();
     keys.sort();
@@ -151,21 +172,7 @@ impl Journal {
                 );
                 suspects.remove(&key);
                 write_list(&suspects_file, &suspects);
-                let file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&crashed_file);
-                match file {
-                    Ok(mut f) => {
-                        if !detail.is_empty() {
-                            let _ = writeln!(f, "# {}", detail.replace('+', " + "));
-                        }
-                        let _ = writeln!(f, "{key}");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, path = %crashed_file.display(), "crashed pipeline not saved")
-                    }
-                }
+                add_crashed(&crashed_file, &key, &detail.replace('+', " + "));
                 crashed.insert(key);
             }
             _ => {
@@ -252,6 +259,17 @@ impl Journal {
         })
     }
 
+    /// Creating `key` faulted and the process went on: refused from the next
+    /// start too.
+    fn faulted(&self, key: &str, detail: &str, code: u32) {
+        let detail = match detail {
+            "" => format!("fault {code:#010x}"),
+            d => format!("{} (fault {code:#010x})", d.replace('+', " + ")),
+        };
+        add_crashed(&self.crashed_file, key, &detail);
+        self.clear(key);
+    }
+
     /// `key` was created without ending the process: no longer a suspect.
     fn clear(&self, key: &str) {
         let mut suspects = self.suspects.lock().unwrap_or_else(|e| e.into_inner());
@@ -286,9 +304,38 @@ impl Drop for Pending<'_> {
     }
 }
 
+/// Pipelines whose creation faulted in this run.
+static FAULTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Creating the pipeline `key` (stages and sizes `detail`) faulted with
+/// `code` at `address`, and the run goes on (`VICTORY_PIPELINE_SOFT_CRASH`):
+/// it is refused from now on, and listed in `crashed.txt` with the journal on.
+pub(crate) fn faulted(key: &str, detail: &str, code: u32, address: usize) {
+    {
+        let mut faulted = FAULTED.lock().unwrap_or_else(|e| e.into_inner());
+        if faulted.iter().any(|k| k == key) {
+            return;
+        }
+        faulted.push(key.to_owned());
+    }
+    let listed = journal().inspect(|j| j.faulted(key, detail, code));
+    tracing::error!(
+        pipeline = key,
+        stages = detail,
+        code = format_args!("{code:#010x}"),
+        address = format_args!("{address:#x}"),
+        listed = listed.is_some(),
+        "creating this host pipeline faulted; it is refused, its draws and dispatches dropped, and the run goes on"
+    );
+}
+
 /// Notes that the pipeline `key` is being created, or `None` if it ended a
-/// run before (it must not be created). Always `Some` with the journal off.
+/// run before or faulted in this one (it must not be created). Otherwise
+/// always `Some` with the journal off.
 pub(crate) fn enter(key: &str, detail: &str) -> Option<Pending<'static>> {
+    if FAULTED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|k| k == key) {
+        return None;
+    }
     match journal() {
         Some(j) => j.enter(key, detail),
         None => Some(Pending {
@@ -422,6 +469,35 @@ mod tests {
         let a = j.enter("1111111111111111", "").unwrap();
         let b = j.enter("2222222222222222", "").unwrap();
         drop((a, b));
+    }
+
+    #[test]
+    fn a_pipeline_whose_creation_faulted_is_refused_now_and_in_later_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real fault, caught on a guarded thread.
+        let fault = std::thread::spawn(|| {
+            super::super::soft_crash::arm();
+            super::super::soft_crash::guarded(|| super::super::soft_crash::tests::read(8))
+        })
+        .join()
+        .unwrap()
+        .unwrap_err();
+        {
+            let j = Journal::open(dir.path(), |_| false).unwrap();
+            let pending = j.enter("9999999999999999+8888888888888888", "vertex-64+pixel-32").unwrap();
+            j.faulted("9999999999999999+8888888888888888", "vertex-64+pixel-32", fault.code);
+            drop(pending);
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("crashed.txt")).unwrap(),
+            "# vertex-64 + pixel-32 (fault 0xc0000005)\n9999999999999999+8888888888888888\n"
+        );
+        let j = Journal::open(dir.path(), |_| false).unwrap();
+        assert!(j.enter("9999999999999999+8888888888888888", "").is_none());
+        // In this run, with the journal on or off.
+        faulted("7777777777777777", "compute-16", fault.code, fault.address);
+        assert!(enter("7777777777777777", "").is_none());
+        assert!(enter("6666666666666666", "").is_some());
     }
 
     #[test]
