@@ -563,6 +563,8 @@ static FUNCTIONS: Table<24> = {
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
+mod journal;
+#[cfg(windows)]
 mod library;
 #[cfg(windows)]
 mod make;
@@ -571,6 +573,7 @@ mod make;
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]
 pub fn use_pipeline_cache(dir: std::path::PathBuf) {
+    journal::use_dir(dir.with_file_name("pipeline-journal"));
     library::use_pipeline_cache(dir);
 }
 

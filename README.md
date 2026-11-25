@@ -137,6 +137,19 @@ victory config
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+Host drivers that crash compiling a shader: with `VICTORY_PIPELINE_JOURNAL=1`
+a pipeline whose creation ends the process is refused from the next run on
+(its draws dropped, as for any refused pipeline) and listed in
+`pipeline-journal\crashed.txt` under the cache folder. Each such pipeline
+costs one crash; delete its line to try it again. Pipelines are still created
+in parallel; when a crash leaves several in creation, they are listed in
+`pipeline-journal\suspects.txt` and each is created alone until it succeeds,
+so a repeat crash names only the pipeline that caused it. Notes of a process
+that is still running (a second instance) are left alone. Quitting while a
+single pipeline is being created looks like a crash to the next run: delete
+that pipeline's line from `crashed.txt` (the comment above it names its
+stages) to have it tried again.
+
 ### Windows shader-test validator
 
 The shader tests use `dxil.dll` to validate Shader Model 6.6 containers.
