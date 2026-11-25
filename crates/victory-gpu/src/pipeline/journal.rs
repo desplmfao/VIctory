@@ -29,7 +29,8 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -46,8 +47,16 @@ struct Journal {
     logged: Mutex<HashSet<String>>,
     /// Pipelines that were being created alongside others when a run ended.
     suspects: Mutex<HashSet<String>>,
-    /// Shared while an ordinary pipeline is created, exclusive for a suspect.
-    gate: RwLock<()>,
+    /// Shared while an ordinary pipeline is created, exclusive for a suspect
+    /// (for at most `alone_for`).
+    gate: Mutex<GateState>,
+    gate_changed: Condvar,
+    /// How long a suspect keeps other pipelines waiting. A suspect can take
+    /// minutes to create (a large compute shader on a cold driver cache), and
+    /// the title waits for the pipelines queued behind it. Past this, the
+    /// others go ahead; if the run then ends, the suspect is one of several
+    /// being created and stays a suspect rather than being refused.
+    alone_for: Duration,
     next: AtomicU64,
 }
 
@@ -230,7 +239,9 @@ impl Journal {
             crashed,
             logged: Mutex::new(HashSet::new()),
             suspects: Mutex::new(suspects),
-            gate: RwLock::new(()),
+            gate: Mutex::new(GateState::default()),
+            gate_changed: Condvar::new(),
+            alone_for: Duration::from_secs(5),
             next: AtomicU64::new(0),
         })
     }
@@ -264,9 +275,9 @@ impl Journal {
         } else {
             HOLDS_GATE.set(true);
             Some(if suspect {
-                Gate::Alone(self.gate.write().unwrap_or_else(|e| e.into_inner()))
+                self.take_alone()
             } else {
-                Gate::Shared(self.gate.read().unwrap_or_else(|e| e.into_inner()))
+                self.take_shared()
             })
         };
         let detail = if detail.is_empty() {
@@ -293,6 +304,71 @@ impl Journal {
         })
     }
 
+    /// Waits until no suspect holds the gate alone or waits for it (or until
+    /// that has lasted `alone_for`), then holds it shared.
+    fn take_shared(&self) -> Gate<'_> {
+        let mut st = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        while st.blocks(self.alone_for) {
+            let wait = st.left(self.alone_for);
+            st = self
+                .gate_changed
+                .wait_timeout(st, wait)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        st.shared += 1;
+        Gate { journal: self, alone: false }
+    }
+
+    /// Waits until no other pipeline holds the gate, then holds it alone; if
+    /// that takes longer than `alone_for`, goes ahead shared instead.
+    fn take_alone(&self) -> Gate<'_> {
+        let mut st = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        st.waiting_alone += 1;
+        st.since.get_or_insert_with(Instant::now);
+        loop {
+            if !st.alone && st.shared == 0 {
+                st.waiting_alone -= 1;
+                st.alone = true;
+                st.since = Some(Instant::now());
+                return Gate { journal: self, alone: true };
+            }
+            if !st.blocks(self.alone_for) {
+                st.waiting_alone -= 1;
+                if st.waiting_alone == 0 && !st.alone {
+                    st.since = None;
+                }
+                st.shared += 1;
+                self.gate_changed.notify_all();
+                return Gate { journal: self, alone: false };
+            }
+            let wait = st.left(self.alone_for);
+            st = self
+                .gate_changed
+                .wait_timeout(st, wait)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    fn release(&self, alone: bool) {
+        let mut st = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if alone {
+            st.alone = false;
+        } else {
+            st.shared -= 1;
+        }
+        // The next suspect waiting gets its own `alone_for`.
+        st.since = (st.alone || st.waiting_alone > 0).then(Instant::now);
+        self.gate_changed.notify_all();
+    }
+
+    /// A suspect holds the gate alone right now (tests).
+    #[cfg(test)]
+    fn held_alone(&self) -> bool {
+        self.gate.lock().unwrap_or_else(|e| e.into_inner()).alone
+    }
+
     /// `key` was created without ending the process: no longer a suspect.
     fn clear(&self, key: &str) {
         let mut suspects = self.suspects.lock().unwrap_or_else(|e| e.into_inner());
@@ -302,10 +378,42 @@ impl Journal {
     }
 }
 
-#[allow(dead_code)]
-enum Gate<'a> {
-    Shared(RwLockReadGuard<'a, ()>),
-    Alone(RwLockWriteGuard<'a, ()>),
+#[derive(Default)]
+struct GateState {
+    /// Ordinary pipelines (and suspects past `alone_for`) being created.
+    shared: usize,
+    /// A suspect is being created alone.
+    alone: bool,
+    /// Suspects waiting to be created alone.
+    waiting_alone: usize,
+    /// Since when a suspect has held the gate alone or waited for it.
+    since: Option<Instant>,
+}
+
+impl GateState {
+    /// Ordinary pipelines must wait: a suspect holds the gate alone or waits
+    /// for it, and has not yet for `alone_for`.
+    fn blocks(&self, alone_for: Duration) -> bool {
+        (self.alone || self.waiting_alone > 0)
+            && self.since.is_some_and(|t| t.elapsed() < alone_for)
+    }
+
+    fn left(&self, alone_for: Duration) -> Duration {
+        self.since.map_or(alone_for, |t| alone_for.saturating_sub(t.elapsed()))
+            + Duration::from_millis(1)
+    }
+}
+
+/// A hold on the journal's gate, given back when dropped.
+struct Gate<'a> {
+    journal: &'a Journal,
+    alone: bool,
+}
+
+impl Drop for Gate<'_> {
+    fn drop(&mut self) {
+        self.journal.release(self.alone);
+    }
 }
 
 /// A pipeline being created; its note is removed when this is dropped,
@@ -404,7 +512,7 @@ mod tests {
         assert_eq!(suspects, "eeeeeeeeeeeeeeee\nffffffffffffffff\n");
         // A suspect is created alone: no other pipeline may hold the gate.
         let alone = j.enter("eeeeeeeeeeeeeeee", "").unwrap();
-        assert!(j.gate.try_read().is_err());
+        assert!(j.held_alone());
         drop(alone);
         // Its creation returned, so it is no longer a suspect.
         let suspects = std::fs::read_to_string(dir.path().join("suspects.txt")).unwrap();
@@ -503,7 +611,7 @@ mod tests {
         // Tried again alone; it ends the run again, so it is listed again,
         // now under this translator.
         let alone = j.enter("9999999999999999", "compute-3360").unwrap();
-        assert!(j.gate.try_read().is_err());
+        assert!(j.held_alone());
         crash(alone);
         drop(j);
         let j = Journal::open(dir.path(), "new", |_| false).unwrap();
@@ -532,6 +640,36 @@ mod tests {
         std::fs::write(dir.path().join("crashed.txt"), "8888888888888888\n").unwrap();
         let j = Journal::open(dir.path(), "t1", |_| false).unwrap();
         assert!(j.enter("8888888888888888", "").is_some());
+    }
+
+    /// A suspect keeps other pipelines waiting only for `alone_for`: one
+    /// that takes minutes to create must not hold up every other pipeline
+    /// (and the title waiting for them) that long.
+    #[test]
+    fn a_slow_suspect_holds_others_up_only_for_a_while() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("suspects.txt"), "aaaaaaaaaaaaaaaa\n").unwrap();
+        let mut j = Journal::open(dir.path(), "t1", |_| false).unwrap();
+        j.alone_for = std::time::Duration::from_millis(200);
+        let j = &j;
+        std::thread::scope(|s| {
+            let slow = j.enter("aaaaaaaaaaaaaaaa", "").unwrap();
+            assert!(j.held_alone());
+            let started = std::time::Instant::now();
+            let other = s.spawn(move || {
+                let p = j.enter("bbbbbbbbbbbbbbbb", "").unwrap();
+                let waited = started.elapsed();
+                drop(p);
+                waited
+            });
+            let waited = other.join().unwrap();
+            assert!(waited >= std::time::Duration::from_millis(150), "{waited:?}");
+            assert!(waited < std::time::Duration::from_secs(3), "{waited:?}");
+            drop(slow);
+        });
+        // Once it returned, nothing holds the gate.
+        assert!(!j.held_alone());
+        drop(j.enter("cccccccccccccccc", "").unwrap());
     }
 
     /// A pipeline made while this thread already holds the gate (a helper
