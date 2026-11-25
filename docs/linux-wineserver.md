@@ -1,11 +1,11 @@
 # Linux: building the patched wineserver (from #2082)
 
-
 Kept in this fork after the upstream pull request was slimmed down: the
 patches are ajsem1337's view-tree change from
 [#340](https://github.com/Marvisak/VIctory/issues/340), ported to several
 Wine trees, with tests and contributions by neonbyte1 (each file credits
 them). The scripts are in `tools/wine/`.
+
 VIctory is a Windows program; on Linux it runs under Wine, in practice a
 Proton build with vkd3d-proton for Direct3D 12. This is not a supported
 platform. These notes are what has worked for testers.
