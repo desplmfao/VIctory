@@ -70,7 +70,21 @@ fn pooled(n: usize) -> Vec<u8> {
         .map(|(i, _)| i);
     let mut v = match fit {
         Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
+        None => {
+            // `Vec::with_capacity` aborts when the allocation fails: try it
+            // first, and on failure free the idle buffers (none fits) before
+            // one last attempt, which still aborts if that fails too.
+            let mut v = Vec::new();
+            if v.try_reserve_exact(n).is_err() && !pool.is_empty() {
+                tracing::warn!(
+                    bytes = n,
+                    "snapshot allocation failed; freeing the idle pool"
+                );
+                pool.clear();
+            }
+            v.reserve_exact(n);
+            v
+        }
     };
     v.clear();
     v
