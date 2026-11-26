@@ -18,7 +18,6 @@
 
 #[cfg(windows)]
 mod bindless;
-mod blind;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
