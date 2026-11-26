@@ -452,20 +452,10 @@ pub(crate) enum View {
 /// old one go stale instead of naming whatever is made at the same address
 /// next.
 ///
-/// Views without a resource object have nothing that releases them, and a
-/// title copies descriptors as bytes, so nothing says when the last
-/// descriptor naming an entry is gone: such entries were kept for the run.
-/// Grand Theft Auto VI writes some 14,000 constant buffer views a frame,
-/// each at the address its constants have that frame: 2,450,139 entries
-/// after four minutes of play, about 1 GB with the index, and 11,000 more
-/// every second (measured on fxceless/victory-fork). So the two kinds that
-/// carry an address are not entries: their records name them whole
-/// ([`constant_words`], [`placed_words`]), and the table holds only what is
-/// bounded: views of resource objects (freed with the resource), samplers
-/// (as many as there are sampler states), and the shapes of placed views
-/// (their descriptions without the address: as many as the title has kinds
-/// of textures and buffers, however often it moves them).
-/// `VICTORY_VIEW_INLINE=0`: every view is an entry, as before.
+/// Constant buffer views and views of placed memory have no resource to
+/// free them, so their records name them whole instead ([`constant_words`],
+/// [`placed_words`]); the table keeps only the shapes of placed views, and
+/// those that do not fit.
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
@@ -510,14 +500,6 @@ const SHAPES: usize = 1 << (62 - PLACED_ADDRESS_BITS);
 /// access, the resource description, and the view's words but the two that
 /// hold the address (10 and 11).
 type Shape = (bool, [u32; 14], [u32; 14]);
-
-/// Whether constant buffer views and views of placed memory are named whole
-/// in their records ([`Views`]). On by default; `VICTORY_VIEW_INLINE=0`
-/// makes every view a table entry, as before.
-fn inline() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_INLINE").is_none_or(|v| v != "0"))
-}
 
 /// The two record words of the 62 bits `payload` of kind `kind`.
 fn kind_words(kind: u32, payload: u64) -> [u32; 2] {
@@ -639,24 +621,22 @@ impl Views {
 /// The two words that name `view` in a record: the view itself where its
 /// kind allows ([`Views`]), else its table entry.
 fn words_for(view: View) -> [u32; 2] {
-    if inline() {
-        match &view {
-            View::Constant(address, size) => {
-                if let Some(words) = constant_words(*address, *size) {
-                    return words;
-                }
+    match &view {
+        View::Constant(address, size) => {
+            if let Some(words) = constant_words(*address, *size) {
+                return words;
             }
-            View::Placed(unordered, resource, desc) => {
-                let (shape, address) = shape_of(*unordered, resource, desc);
-                if address >> PLACED_ADDRESS_BITS == 0 {
-                    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(shape) = views.shape(shape) {
-                        return placed_words(shape, address);
-                    }
-                }
-            }
-            _ => {}
         }
+        View::Placed(unordered, resource, desc) => {
+            let (shape, address) = shape_of(*unordered, resource, desc);
+            if address >> PLACED_ADDRESS_BITS == 0 {
+                let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(shape) = views.shape(shape) {
+                    return placed_words(shape, address);
+                }
+            }
+        }
+        _ => {}
     }
     VIEWS.lock().unwrap_or_else(|e| e.into_inner()).entry(view)
 }
@@ -724,13 +704,24 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 }
 
 /// For each record (tag, index, generation): whether it names a view that
-/// is current, as [`view_at`] would find it (one lock for them all).
+/// is current, as [`view_at`] would find it (one lock for them all): a
+/// table entry at its own generation, a constant buffer view held whole, or
+/// a placed view held whole whose shape is known.
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     records
         .iter()
         .map(|&[tag, i, generation]| {
-            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+            tag == VIEW_TAG
+                && match generation >> KIND_SHIFT {
+                    0 => views.list.get(i as usize).is_some_and(|(_, at)| *at == generation),
+                    CONSTANT => true,
+                    PLACED => {
+                        ((payload(i, generation) >> PLACED_ADDRESS_BITS) as usize)
+                            < views.shapes.len()
+                    }
+                    _ => false,
+                }
         })
         .collect()
 }
@@ -1129,6 +1120,23 @@ pub(crate) mod tests {
         heap[0] = 0;
     }
 
+    /// A null CBV description overwrites the slot (D3D12 null CBV), so a
+    /// later read does not see the previous view.
+    #[test]
+    fn null_cbv_clears_a_stale_view() {
+        let null = std::ptr::null();
+        let slots = [0u64; 2 * 4];
+        let a = slots.as_ptr() as u64;
+        create_cbv(null, &[0x1000, 1, 256, 0], a);
+        assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, 256)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
+        create_srv(null, null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Shader(0, None)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
+    }
+
     /// Constant buffer views are named whole in their records: any address
     /// a program can have, any size below 16 KiB, multiples of 256 bytes
     /// up to 4 MiB; what does not fit says so.
@@ -1181,14 +1189,10 @@ pub(crate) mod tests {
     }
 
     /// A title that writes constant buffer views and views of placed memory
-    /// at ever new addresses adds nothing to the table (it grew by 11,000
-    /// entries a second in the world); one shape stands for all the placed
-    /// views alike.
+    /// at ever new addresses adds nothing to the table; one shape stands
+    /// for all the placed views alike.
     #[test]
     fn views_at_new_addresses_add_no_entries() {
-        if !inline() {
-            return;
-        }
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
@@ -1276,21 +1280,42 @@ pub(crate) mod tests {
         assert_eq!(generation, 1, "wrapped to 1, not into the kind bits");
     }
 
-    /// A null CBV description overwrites the slot (D3D12 null CBV), so a
-    /// later read does not see the previous view.
+    /// Heap syncs ([`views_current`]) find current what [`view_at`] finds:
+    /// constant buffer and placed views held whole in their records as well
+    /// as live table entries; not released entries, unknown shapes or kinds,
+    /// nor records without the tag.
     #[test]
-    fn null_cbv_clears_a_stale_view() {
+    fn views_held_whole_are_current_for_heap_syncs() {
         let null = std::ptr::null();
-        let slots = [0u64; 2 * 4];
-        let a = slots.as_ptr() as u64;
-        create_cbv(null, &[0x1000, 1, 256, 0], a);
-        assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, 256)));
-        create_cbv(null, std::ptr::null(), a);
-        assert_eq!(view(a), Some(View::Constant(0, 0)));
-        create_srv(null, null, std::ptr::null(), a);
-        assert_eq!(view(a), Some(View::Shader(0, None)));
-        create_cbv(null, std::ptr::null(), a);
-        assert_eq!(view(a), Some(View::Constant(0, 0)));
+        let slots = [0u64; 4 * 4];
+        let at = |k: usize| slots.as_ptr() as u64 + k as u64 * 32;
+        // SAFETY: slot `k` of the 32-byte slots above.
+        let words = |k: usize| unsafe { *(at(k) as *const [u32; 3]) };
+        create_cbv(null, &[0x9_0000, 6, 512, 0], at(0));
+        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee1_0000 + k as u32);
+        let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a71_0000 + k as u32);
+        (desc[10], desc[11]) = (0x4940_0000, 0xd);
+        create_placed_srv(null, &resource, &desc, at(1));
+        let released = 0x7_7f00_0000_usize;
+        record(at(2), View::Shader(released, None));
+        record(at(3), View::Shader(0x7_7f10_0000, None));
+        let mut records: Vec<[u32; 3]> = (0..4).map(words).collect();
+        assert_eq!(records[0][2] >> KIND_SHIFT, CONSTANT, "held whole");
+        assert_eq!(records[1][2] >> KIND_SHIFT, PLACED, "held whole");
+        forget(released);
+        // A placed view of a shape never numbered, a kind there is not, and
+        // a record without the tag.
+        let unknown = placed_words(SHAPES as u32 - 1, 0x4940_0000);
+        records.push([VIEW_TAG, unknown[0], unknown[1]]);
+        records.push([VIEW_TAG, 0, 3 << KIND_SHIFT | 1]);
+        records.push([0, records[0][1], records[0][2]]);
+        let current = views_current(&records);
+        let found: Vec<bool> = records
+            .iter()
+            .map(|&[tag, i, generation]| tag == VIEW_TAG && view_at(i, generation).is_some())
+            .collect();
+        assert_eq!(current, found);
+        assert_eq!(current, [true, true, false, true, false, false, false]);
     }
 
     /// A released resource's views go stale; the same view of a new
