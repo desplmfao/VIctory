@@ -18,7 +18,7 @@ This `renderer` branch adds the rendering work on top: #439 and the rendering
 pull requests, our fix for vkd3d-proton, and two diagnostics tools. It is
 what draws the world (below); `main` stays the smaller, steadier stack.
 
-Upstream base: Marvisak/VIctory `main` at `67e8ae1`.
+Upstream base: Marvisak/VIctory `main` at `63bcca4`.
 
 ### State (2026-11-25): the world is drawn on NVIDIA under Linux
 
@@ -75,9 +75,7 @@ easier to read at 1–2 fps.
 
 | PR | Author | What it does |
 |----|--------|--------------|
-| [#2143](https://github.com/Marvisak/VIctory/pull/2143) | desplmfao | A program's constant table starts after its instructions: NVIDIA kept whole-program tables in per-thread local memory (GBs of video memory); without it the world does not fit in 16 GB |
 | [#1849](https://github.com/Marvisak/VIctory/pull/1849) | crashbashash | Guarded free memory; fixes the world freeze under Wine ([#1921](https://github.com/Marvisak/VIctory/issues/1921)) |
-| [#259](https://github.com/Marvisak/VIctory/pull/259) | desplmfao | Query a descriptor's level count only when word 3 is read (NVIDIA pipeline crash) |
 | [#177](https://github.com/Marvisak/VIctory/pull/177) (one commit) | Ortomanic | Key heap handles by element type; without it NVIDIA crashes creating several compute pipelines |
 | [#491](https://github.com/Marvisak/VIctory/pull/491) | desplmfao | `VICTORY_PIPELINE_JOURNAL=1`: skip pipelines whose creation crashed an earlier run (the NVIDIA compiler ends the process on some; a fresh build can take a few runs to list them) |
 | [#2153](https://github.com/Marvisak/VIctory/pull/2153) | SaymonMaster14 ([#472](https://github.com/Marvisak/VIctory/pull/472)), rebased by desplmfao | Caps the idle snapshot pool (2 GB less RAM in the world) and shares one texture staging buffer |
@@ -85,26 +83,22 @@ easier to read at 1–2 fps.
 | [#2071](https://github.com/Marvisak/VIctory/pull/2071) | 0xkn0wh3r3 | Frees the executable's bytes once loaded (228 MB) |
 | [#2088](https://github.com/Marvisak/VIctory/pull/2088) | kxiserino ([#402](https://github.com/Marvisak/VIctory/pull/402)), desplmfao | Reuses loose windows that hold a range; 256 KiB windows instead of 4 MiB |
 | [#2112](https://github.com/Marvisak/VIctory/pull/2112) | desplmfao | Opt-in (`VICTORY_IN_PLACE=1`): title memory read in place instead of copied; on vkd3d-proton only allocations already 90% resident (opening one pins all of it) |
-| [#2162](https://github.com/Marvisak/VIctory/pull/2162) | desplmfao | Depth twins share their scratch buffers (about 280 MB video memory) |
 | [#2389](https://github.com/Marvisak/VIctory/pull/2389) | desplmfao (fxceless's mechanism, 507KAZ's tip) | Opt-in `VICTORY_LEVELS_ON_DEMAND=1`: streamed textures take video memory only for the levels the title holds (about 5 GB less) |
 | [#2230](https://github.com/Marvisak/VIctory/pull/2230) | desplmfao | Taps between two frames are not lost (input at low frame rates). **On by default in this fork**; `VICTORY_INPUT_LATCH=0` turns it off |
-| [#2218](https://github.com/Marvisak/VIctory/pull/2218) | desplmfao (from youroot-code's fxceless/victory-fork#23) | GameInput keeps 256 readings per device, not 32 (input read through the history is not lost at low frame rates) |
 | [#439](https://github.com/Marvisak/VIctory/pull/439) (with #233, #320) | r4tedx | Wave64 compute on 32-lane GPUs (NVIDIA): one console wave runs in the console flow |
 | [#2309](https://github.com/Marvisak/VIctory/pull/2309) | powplusplus ([#1885](https://github.com/Marvisak/VIctory/pull/1885), one commit), desplmfao | One back edge per loop header and per block, so vkd3d-proton's dxil-spirv converts #439's loops instead of recursing until the process dies |
 | [#1722](https://github.com/Marvisak/VIctory/pull/1722) | Impre-visible | The host pipeline library works under Wine |
-| [#1769](https://github.com/Marvisak/VIctory/pull/1769) | Impre-visible | LDS accesses outside the program's allocation read 0 |
-| [#1763](https://github.com/Marvisak/VIctory/pull/1763) | n-romanovich | Refuse typed UAVs in unsupported formats |
 | [#1751](https://github.com/Marvisak/VIctory/pull/1751) | JurajSimicevic | Capped view heaps keep the full dynamic range (NVIDIA) |
-| [#1906](https://github.com/Marvisak/VIctory/pull/1906) | Slay326 | View addresses for tables made afresh |
 | [#688](https://github.com/Marvisak/VIctory/pull/688) | iurysf | Take back dynamic descriptor slots when a heap runs short |
-| [#1872](https://github.com/Marvisak/VIctory/pull/1872) | BastienRodz | The depth twin's converter builds its root signature under Wine |
-| [#158](https://github.com/Marvisak/VIctory/pull/158) | r4tedx | The depth bounds test reaches the host |
 | [#2292](https://github.com/Marvisak/VIctory/pull/2292) (draft) | desplmfao | Opt-in `VICTORY_PIPELINE_SOFT_CRASH=1`: a pipeline whose creation faults is refused and the title goes on |
 | [#2167](https://github.com/Marvisak/VIctory/pull/2167) | RVZO6 | Writes through title memory test the written-pages bit before the atomic OR: Microsoft's BVH rehydration passes no longer take the GPU past the driver's timeout |
 | [#2118](https://github.com/Marvisak/VIctory/pull/2118) | 0xkn0wh3r3 | The BVH builder runs whole or not at all (a half-run builder wrote garbage into title memory) |
 | [#2311](https://github.com/Marvisak/VIctory/pull/2311) | Bullet18x | Programs that walk the BVH wait until the builder has run whole |
 | [#2310](https://github.com/Marvisak/VIctory/pull/2310) | desplmfao | Diagnostics, `VICTORY_GPU_BREADCRUMBS=1`: when a submission runs too long or the device is lost, names the draw or dispatch the GPU is in |
-| [#1152](https://github.com/Marvisak/VIctory/pull/1152) | pablogonz12 | No blending on integer render targets: the room's wall mesh pipeline is made instead of refused (walls no longer vanish now and then) |
+
+Merged upstream since: #2143 (constant tables), #2162 (depth twin scratch buffers), #1152, #1906 and #158.
+Main now does what #1769 (LDS bounds, as #1949) and #1763 (typed UAV formats, as #2462) did. Closed upstream:
+#259 (main does it more generally), #2218 (the title cannot hit the case), #2366. #1872 (closed) stays in this branch.
 
 Running under Proton is much faster with the wineserver patch from
 [#340](https://github.com/Marvisak/VIctory/issues/340); see
@@ -113,25 +107,32 @@ Running under Proton is much faster with the wineserver patch from
 
 ## Status (2026-11-24)
 
-**Not playable yet.** The title boots, runs its menus at its own 30 fps,
-loads the world and shows it: slowly, and with rendering defects.
+**Not playable yet, because of the framerate: about 1 frame per second in the
+world.** Nothing else keeps the game from working: the title boots, runs its
+menus at its own 30 fps, loads the world, plays the intro cutscene and
+reaches the **prologue**, the mission after it, with the graphics fully
+displayed. 
 
 | Stage | State |
 |-------|-------|
 | Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
 | Intro video with sound | works |
 | Start screen, profile and saves | works |
-| Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | drawn and shown: streets, buildings, vehicles, characters, the title card and credits; 1-2 s per frame. Surfaces are unlit, a band of distant geometry is missing, characters come out broken in some shots |
+| Loading into the world (about a minute) | works |
+| The intro cutscene | plays at about 1 fps (0.9-1.0 s a frame, warm cache, quiet machine): textured and lit characters with whole hair, buildings, sky, depth of field, the title card, credits and interface. Missing: ray-traced shadows and indirect light, the local-light shadow mask. Seen in some shots: a pink band over nearer bodies, a stand-in head on a secondary character for a few frames |
+| The prologue | reached; the graphics are fully displayed, at about 1 fps |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+In the intro cutscene at 1 fps the opening credits land over other shots than
+on a console: they follow the frame count, the shots follow the clock.
 
-> **Warning.** Entering the world on a real GPU has hung it in earlier
-> builds, and Windows then resets the display driver (every monitor goes
-> black for a moment). The latest runs did not, but it is not ruled out; a
-> run can also end on a GPU fault (`crashes.log`). A diagnostics build with
-> `VICTORY_D3D12_WARP=1` renders on the software adapter instead (too slow
-> to reach the world in minutes).
+Tested on one machine: Windows 11, AMD RX 6700 XT (12 GB).
+
+> **Warning.** Entering the world on a real GPU hung it in earlier builds,
+> and Windows then reset the display driver (every monitor goes black for a
+> moment). The latest runs, several minutes each in the world, did not, but
+> it is not ruled out; a run can also end on a GPU fault (`crashes.log`). A
+> diagnostics build with `VICTORY_D3D12_WARP=1` renders on the software
+> adapter instead (too slow to reach the world in minutes).
 
 What each part does today and what it still needs:
 
@@ -144,10 +145,10 @@ What each part does today and what it still needs:
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address (ray-tracing structures), depth written from compute, pipelines pre-built or made by worker threads and kept on disk, depth bounds on supporting adapters (synthetic tests) | Lighting (surfaces are unlit) and some missing geometry; frames take 1-2 s; draws of untranslated shaders are dropped; real queries, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: mesh 8,765 of 8,765, vertex/pixel 12,550 of 12,592, compute 2,579 of 2,637 | Merged geometry stages (195 programs) and about 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
+| GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address, depth written from compute, lists that wait for values other queues write, textures made when a shader first reads them, pipelines pre-built or made by worker threads and kept on disk, depth bounds on supporting adapters (synthetic tests) | The title's ray-tracing structures are never built (no ray-traced shadows or indirect light in the intro cutscene); about 1 s a frame; draws of untranslated shaders are dropped; real queries, HDR and scaling are missing |
+| Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: all but under 300 of 24,387 programs | Merged geometry stages (195 programs) and under 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Runs through the menus to the loading screen | The world, as above |
+| Series S mode | Menus, loading and the world run with the PC upscaler (`VICTORY_FIDELITYFX_DIR`, about 1 s a frame) | The title's own upscaler DLLs: six of their passes are untranslated, so their picture is wrong |
 
 ## Getting started
 
@@ -161,10 +162,19 @@ repository then fetches the pinned toolchain. Building needs the MSVC C++
 build tools: Visual Studio or its Build Tools with the "Desktop development
 with C++" workload.
 
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
+Keep the build paths short. From a checkout about 170 characters deep, the
+`blake3` dependency's build script fails in `ml64.exe` with
+`A1009: line too long`, even with long paths enabled in Windows, because
+its object files land under `target`. Set `CARGO_TARGET_DIR` to a short
+absolute path (`$env:CARGO_TARGET_DIR = 'C:\vt'`; `victory.exe` is then
+in `C:\vt\release` instead of `target\release`), or check out the
+repository nearer the drive's root.
+
+A run in the world takes about 33 GB of Windows commit (RAM plus paging
+file) and about 10 GB of video memory. The tested machine has 32 GB of RAM
+and a commit limit of about 80 GB. Check **Committed** under **Task Manager →
+Performance → Memory**. If `crashes.log` reports Windows error 1455, close
+other applications or increase the Windows paging file size, then retry.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
@@ -187,10 +197,17 @@ translator) translates every shader the title can ask for into the cache
 they are translated at first use, and their draws wait. With `--pipelines`
 it then makes every pipeline in the title's shader pack (inside
 `shaders.rpf`) into the host pipeline library (about 27,000 pipelines, 4 MB;
-some 20 minutes on 16 threads, most of it the 2,700 compute ones), so a run
+estimated at 20 minutes on 16 threads, but about 2 pipelines a second after a
+translator change that touches most programs, which is hours), so a run
 compiles none of those either; the library belongs to the GPU and driver it
 was made on. Run again, it skips what is there in seconds; stopped
-early, it keeps what it made.
+early, it keeps what it made. Without it, a run makes the pipelines it needs
+on worker threads and keeps them, so the first runs after a translator
+change are slower and show missing draws for a while.
+
+To get into the game, press A (Enter) on each first-boot screen and again on
+the start screen. Loading the world takes about a minute; the intro cutscene
+plays, then the prologue starts.
 
 Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
 it with the PC build on your GPU instead of the console build, get the
@@ -252,6 +269,9 @@ victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
 victory config
 ```
 
+`translate --jobs N` requires a positive worker count. Omit it to use the
+default worker count.
+
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
@@ -303,7 +323,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_GPU_BREADCRUMBS=1` | when a submission runs 3 s or longer, or the device is lost: each list's progress and the draw or dispatch the GPU is in (its pipeline, frame and the commands before it). The GPU then finishes each command before starting the next, so it runs slower |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
+| `VICTORY_SKIP_PIPELINES=<hash>,...` | skip host pipeline creation and omit draws and dispatches, including indirect ones, when the pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
 | `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
