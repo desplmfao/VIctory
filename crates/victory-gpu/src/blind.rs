@@ -104,26 +104,7 @@ static NAMED: AtomicBool = AtomicBool::new(true);
 fn cut_wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_FRAME_CUT").is_some_and(|v| v == "1" || v == "auto");
-        if std::env::var_os("VICTORY_FRAME_CUT").is_some_and(|v| v == "auto") {
-            // Moves the gap one tenth on by itself every 10 s: 1/10 .. 10/10,
-            // then off, and again.
-            std::thread::Builder::new()
-                .name("victory-frame-gap".into())
-                .spawn(|| loop {
-                    std::thread::sleep(std::time::Duration::from_secs(10));
-                    let cut = CUT.load(Ordering::Relaxed);
-                    let new = match cut {
-                        u64::MAX => 0,
-                        9 => u64::MAX,
-                        c => c + 1,
-                    };
-                    CUT.store(new, Ordering::Relaxed);
-                    NAMED.store(new == u64::MAX, Ordering::Relaxed);
-                    tracing::warn!(tenth = new.wrapping_add(1), "VICTORY_FRAME_CUT: auto");
-                })
-                .ok();
-        }
+        let on = std::env::var_os("VICTORY_FRAME_CUT").is_some_and(|v| v == "1");
         if on {
             tracing::warn!("VICTORY_FRAME_CUT: a tenth of each frame is dropped from where numpad - / + (F10/F11) put it; numpad * (F12) off");
         }
