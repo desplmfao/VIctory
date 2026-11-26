@@ -812,6 +812,22 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+/// The GPU wrote `[at, at + len)` of title memory directly (a buffer in
+/// place, `crate::shadow`): every tracker holding its pages, and the pages
+/// showing the same memory elsewhere, sees them changed. Unlike
+/// [`writing`], nothing is saved (the write happened already, there is no
+/// "before" to keep) and no guard is opened (a GPU write does not go
+/// through the CPU's page protection, so title writes stay seen).
+pub(crate) fn gpu_wrote(at: usize, len: usize) {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut g = guards();
+    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    mark_changed(&mut g, first, last, false);
+    for page in others {
+        mark_changed(&mut g, page, page + 1, false);
+    }
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {

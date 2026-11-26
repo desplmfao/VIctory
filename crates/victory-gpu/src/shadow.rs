@@ -448,7 +448,13 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if self.in_place && from < to {
-            drop(crate::watch::writing(from, to - from));
+            // The GPU wrote there: every tracker holding the pages sees them
+            // changed, with nothing saved and no guard opened. Not
+            // `watch::writing` (for kernel writes): it saved every page in
+            // every tracker and opened the guards, so each submission had GBs
+            // of pages saved and checked again (5.7-7.7 s a frame on Windows,
+            // kawaii-shakal on #2112).
+            crate::watch::gpu_wrote(from, to - from);
         }
     }
 
