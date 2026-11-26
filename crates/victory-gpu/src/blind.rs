@@ -8,10 +8,13 @@
 //! fraction of the time. Without the variable nothing changes and F9 does
 //! nothing.
 //!
-//! Frame cut (testing aid): with `VICTORY_FRAME_CUT=1` each frame runs only
-//! its first N draws and dispatches (in submission order) and drops the
-//! rest. F10 moves the cut 10% of the last frame earlier, F11 later, F12
-//! turns it off (all run). Each change logs the cut and the pipeline at it:
+//! Frame gap (testing aid): with `VICTORY_FRAME_CUT=1` each frame drops one
+//! window of a tenth of its draws and dispatches (in submission order);
+//! everything before and after it runs, the final composite included.
+//! Numpad minus moves the window a tenth earlier, numpad plus later, numpad
+//! star turns it off (all run); F10, F11 and F12 do the same.
+//! The keys come from GameInput's host poll (every 8 ms, [`keys`]), so a tap
+//! counts however slow frames are. Each change logs the cut and the pipeline at it:
 //! moving it until a wrong layer disappears names the pass that draws it.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -91,6 +94,9 @@ pub(crate) fn poll() {
 static OPS: AtomicU64 = AtomicU64::new(0);
 static LAST_OPS: AtomicU64 = AtomicU64::new(0);
 static CUT: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Pipelines dropped in the window this frame (the first few), to name
+/// them once.
+static IN_GAP: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 /// The pipeline at the cut in the last frame, to name it once.
 static AT_CUT: AtomicUsize = AtomicUsize::new(0);
 static NAMED: AtomicBool = AtomicBool::new(true);
@@ -100,7 +106,7 @@ fn cut_wanted() -> bool {
     *ON.get_or_init(|| {
         let on = std::env::var_os("VICTORY_FRAME_CUT").is_some_and(|v| v == "1");
         if on {
-            tracing::warn!("VICTORY_FRAME_CUT: F10 cuts each frame 10% earlier, F11 later, F12 off");
+            tracing::warn!("VICTORY_FRAME_CUT: a tenth of each frame is dropped from where numpad - / + (F10/F11) put it; numpad * (F12) off");
         }
         on
     })
@@ -113,15 +119,26 @@ pub(crate) fn skip(pipeline: usize) -> bool {
     if on() {
         return true;
     }
+    if !cut_wanted() {
+        return false;
+    }
+    let n = OPS.fetch_add(1, Ordering::Relaxed);
     let cut = CUT.load(Ordering::Relaxed);
     if cut == u64::MAX {
         return false;
     }
-    let n = OPS.fetch_add(1, Ordering::Relaxed);
+    let width = (LAST_OPS.load(Ordering::Relaxed) / 10).max(1);
+    let dropped = n >= cut && n < cut + width;
     if n == cut {
         AT_CUT.store(pipeline, Ordering::Relaxed);
     }
-    n >= cut
+    if dropped && !NAMED.load(Ordering::Relaxed) {
+        let mut gap = IN_GAP.lock().unwrap_or_else(|e| e.into_inner());
+        if gap.len() < 64 && !gap.contains(&pipeline) {
+            gap.push(pipeline);
+        }
+    }
+    dropped
 }
 
 /// At present: frame cut keys and bookkeeping.
@@ -129,48 +146,68 @@ fn poll_cut() {
     if !cut_wanted() {
         return;
     }
-    let ops = OPS.swap(0, Ordering::Relaxed);
-    if CUT.load(Ordering::Relaxed) == u64::MAX {
-        LAST_OPS.store(ops, Ordering::Relaxed);
-    } else {
-        LAST_OPS.store(LAST_OPS.load(Ordering::Relaxed).max(ops), Ordering::Relaxed);
-    }
+    // Every draw and dispatch is counted, cut or not: the frame's size.
+    LAST_OPS.store(OPS.swap(0, Ordering::Relaxed), Ordering::Relaxed);
     if !NAMED.swap(true, Ordering::Relaxed) {
-        let at = AT_CUT.load(Ordering::Relaxed);
+        let gap = std::mem::take(&mut *IN_GAP.lock().unwrap_or_else(|e| e.into_inner()));
         #[cfg(feature = "diagnostics")]
-        let shaders = crate::pipeline::shaders_of(at as crate::object::This);
+        let shaders: Vec<String> = gap.iter().map(|&p| crate::pipeline::shaders_of(p as crate::object::This)).collect();
         #[cfg(not(feature = "diagnostics"))]
-        let shaders = format!("{at:#x}");
-        tracing::warn!(cut = CUT.load(Ordering::Relaxed), of = LAST_OPS.load(Ordering::Relaxed), at_cut = %shaders, "VICTORY_FRAME_CUT");
-    }
-    #[cfg(windows)]
-    {
-        static DOWN: [AtomicBool; 3] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
-        for (i, key) in [0x79, 0x7A, 0x7B].into_iter().enumerate() {
-            // SAFETY: a plain query.
-            let down = unsafe { GetAsyncKeyState(key) } < 0;
-            if !down {
-                DOWN[i].store(false, Ordering::Relaxed);
-                continue;
-            }
-            if DOWN[i].swap(true, Ordering::Relaxed) {
-                continue;
-            }
-            let total = LAST_OPS.load(Ordering::Relaxed).max(1);
-            let step = (total / 10).max(1);
-            let cut = CUT.load(Ordering::Relaxed);
-            let new = match i {
-                0 => cut.min(total).saturating_sub(step),
-                1 => cut.min(total).saturating_add(step).min(total),
-                _ => u64::MAX,
-            };
-            CUT.store(new, Ordering::Relaxed);
-            NAMED.store(new == u64::MAX, Ordering::Relaxed);
-            if new == u64::MAX {
-                tracing::warn!("VICTORY_FRAME_CUT: off");
-            }
+        let shaders: Vec<String> = gap.iter().map(|p| format!("{p:#x}")).collect();
+        let _ = AT_CUT.load(Ordering::Relaxed);
+        tracing::warn!(at = %caption(), from = CUT.load(Ordering::Relaxed), of = LAST_OPS.load(Ordering::Relaxed), pipelines = gap.len(), "VICTORY_FRAME_CUT: window dropped");
+        for (i, s) in shaders.iter().enumerate() {
+            tracing::warn!(i, "VICTORY_FRAME_CUT dropped {s}");
         }
     }
+
+}
+
+
+/// The host keys down now (virtual-key codes), from GameInput's poll: a
+/// press of numpad minus / F10 moves the cut earlier, numpad plus / F11
+/// later, numpad star / F12 turns it off.
+pub fn keys(down: &[u8]) {
+    if !cut_wanted() {
+        return;
+    }
+    static DOWN: [AtomicBool; 3] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
+    for (i, keys) in [[0x6D, 0x79], [0x6B, 0x7A], [0x6A, 0x7B]].into_iter().enumerate() {
+        let now = down.iter().any(|k| keys.contains(k));
+        if !now || DOWN[i].swap(now, Ordering::Relaxed) {
+            DOWN[i].store(now, Ordering::Relaxed);
+            continue;
+        }
+        let total = LAST_OPS.load(Ordering::Relaxed).max(1);
+        let step = (total / 10).max(1);
+        let cut = CUT.load(Ordering::Relaxed);
+        let new = match (i, cut) {
+            // Off: minus starts at the last tenth, plus at the first.
+            (0, u64::MAX) => total.saturating_sub(step),
+            (1, u64::MAX) => 0,
+            (0, c) => c.saturating_sub(step),
+            (1, c) if c.saturating_add(step) >= total => u64::MAX,
+            (1, c) => c + step,
+            _ => u64::MAX,
+        };
+        CUT.store(new, Ordering::Relaxed);
+        NAMED.store(new == u64::MAX, Ordering::Relaxed);
+        tracing::warn!(cut = new, of = total, "VICTORY_FRAME_CUT: key");
+    }
+}
+
+/// For the window title: where the frame gap is (` | gap 4/10`), or nothing.
+pub(crate) fn caption() -> String {
+    if !cut_wanted() {
+        return String::new();
+    }
+    let cut = CUT.load(Ordering::Relaxed);
+    if cut == u64::MAX {
+        return " | gap off".into();
+    }
+    let total = LAST_OPS.load(Ordering::Relaxed).max(1);
+    let step = (total / 10).max(1);
+    format!(" | gap {}/10", (cut / step + 1).min(10))
 }
 
 #[cfg(test)]

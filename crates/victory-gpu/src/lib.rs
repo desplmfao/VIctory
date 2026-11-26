@@ -19,6 +19,8 @@
 #[cfg(windows)]
 mod bindless;
 mod blind;
+/// Frame-cut keys from the input poll (`VICTORY_FRAME_CUT`).
+pub use blind::keys as frame_cut_keys;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;

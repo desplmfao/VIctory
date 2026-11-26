@@ -445,6 +445,7 @@ impl Hub {
             let scripted: [KeyState; 0] = [];
             (pads, source.keys(), scripted)
         };
+        victory_gpu::frame_cut_keys(&keys.iter().map(|k| k.virtual_key).collect::<Vec<_>>());
         let events = self.state().poll(&self.devices, pads, keys, &scripted);
         self.deliver(events);
     }
