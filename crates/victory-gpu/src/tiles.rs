@@ -24,13 +24,21 @@
 //! reads it. A level without tiles reads as zeros (tiled resources tier 2),
 //! as the zeros the upload of unmapped memory left before. Before the host
 //! GPU itself writes the texture (a copy, a resolve), every level is given
-//! tiles, and the levels just given are uploaded from what the title holds
-//! by the upload list of the submission that runs the write, ahead of it
-//! (`texture.rs` `host_writes`).
+//! tiles when the submission that runs the write is prepared (not when its
+//! list is recorded: a list may be reset unrun, and lists run in submission
+//! order, not recording order), and the levels just given are uploaded from
+//! what the title holds by that submission's upload list, ahead of it
+//! (`texture.rs` `host_writes`, `give_for_host_writes`). Mappings are
+//! queued only while a submission is prepared, and that submission waits
+//! for them.
 //!
 //! shortcut: tiles are not taken back while the host texture lives; a level
 //! the title unmaps keeps them (and what was last uploaded). They go
-//! back with the host texture.
+//! back after the host texture ([`free`]), once nothing else holds its
+//! resource (heap slots, retired copies, lists hold clones of it) and the
+//! mappings queued for it have run: until then another texture given the
+//! same tiles would alias it, and a heap released would leave it mapped to
+//! freed memory.
 //! shortcut: views are not clamped to the first level with memory: a
 //! level the title does not hold reads as zeros, as before.
 //!
@@ -59,9 +67,34 @@ const HEAP_TILES: u32 = 1024;
 /// refreshes that left a mapped level without tiles.
 static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
+/// The host GPU's tiled resources tier (0 if it will not say).
+fn tier(device: &ID3D12Device) -> i32 {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    // SAFETY: a plain query into a structure of its own size.
+    let asked = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    };
+    if asked.is_ok() { options.TiledResourcesTier.0 } else { 0 }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: textures made on this thread are made this way whatever the
+    /// switch says (where the host GPU has tier 2).
+    pub(crate) static FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Whether title textures are made this way: the switch, and a host GPU
 /// that reads zeros from levels without memory (tiled resources tier 2).
 pub(crate) fn wanted() -> bool {
+    #[cfg(test)]
+    if FORCED.with(std::cell::Cell::get) {
+        return crate::host::host().is_some_and(|h| tier(&h.device) >= D3D12_TILED_RESOURCES_TIER_2.0);
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         if std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_none_or(|v| v != "1") {
@@ -70,17 +103,8 @@ pub(crate) fn wanted() -> bool {
         let Some(host) = crate::host::host() else {
             return false;
         };
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
-        // SAFETY: a plain query into a structure of its own size.
-        let asked = unsafe {
-            host.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS,
-                (&raw mut options).cast(),
-                size_of_val(&options) as u32,
-            )
-        };
-        let tier = options.TiledResourcesTier.0;
-        let on = asked.is_ok() && tier >= D3D12_TILED_RESOURCES_TIER_2.0;
+        let tier = tier(&host.device);
+        let on = tier >= D3D12_TILED_RESOURCES_TIER_2.0;
         tracing::info!(
             tier,
             on,
@@ -169,6 +193,87 @@ impl Heap {
 /// the host GPU (textures name their heaps by place).
 static POOL: Mutex<Vec<Option<Heap>>> = Mutex::new(Vec::new());
 
+/// The bytes of the pool's heaps no texture holds (counted by the host as
+/// in use).
+pub(crate) fn free_bytes() -> u64 {
+    reap();
+    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.iter().flatten().map(|h| u64::from(h.free_tiles())).sum::<u64>() * TILE
+}
+
+/// `UpdateTileMappings` calls queued so far (counted once each call has
+/// returned), and how many of the first ones a submission waited for has
+/// run after ([`ran`]).
+static QUEUED: AtomicU64 = AtomicU64::new(0);
+static RAN: AtomicU64 = AtomicU64::new(0);
+
+/// The mappings queued so far: a submission that reads this before it
+/// signals its fence has them all run once it waited for the fence
+/// ([`ran`]).
+pub(crate) fn queued() -> u64 {
+    QUEUED.load(Ordering::Acquire)
+}
+
+/// The first `count` mappings ([`queued`] before the fence was signalled)
+/// have run: the host queue reached a fence signalled after them.
+pub(crate) fn ran(count: u64) {
+    RAN.fetch_max(count, Ordering::AcqRel);
+}
+
+/// A host texture let go of ([`free`]): its resource (a holder of our own),
+/// its tiles, and the mappings queued when it went.
+struct Freed {
+    texture: ID3D12Resource,
+    tiled: Tiled,
+    queued: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the rest is plain data.
+unsafe impl Send for Freed {}
+
+static FREED: Mutex<Vec<Freed>> = Mutex::new(Vec::new());
+
+/// The host texture `texture` with tiles `tiled` is let go of (its
+/// `HostTexture` dropped): the tiles go back once nothing else holds
+/// `texture` (heap slots keep views' resources until a submission has run,
+/// retired copies until the end of one, lists until they are reset) and
+/// every mapping queued so far has run ([`reap`], at the next takes and
+/// submissions). Before, another texture given the same tiles would alias
+/// this one, and a heap released would leave it mapped to freed memory.
+pub(crate) fn free(texture: ID3D12Resource, tiled: Tiled) {
+    let queued = queued();
+    FREED.lock().unwrap_or_else(|e| e.into_inner()).push(Freed { texture, tiled, queued });
+    reap();
+}
+
+/// Gives back the tiles of the textures let go of that nothing else holds
+/// now and whose mappings have run.
+pub(crate) fn reap() {
+    let ready: Vec<Freed> = {
+        let mut freed = FREED.lock().unwrap_or_else(|e| e.into_inner());
+        if freed.is_empty() {
+            return;
+        }
+        let ran = RAN.load(Ordering::Acquire);
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < freed.len() {
+            if freed[i].queued <= ran && crate::placement::last_holder(&freed[i].texture) {
+                ready.push(freed.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        ready
+    };
+    // Outside the lock: each resource released, then its tiles given back
+    // (`Tiled`'s drop).
+    for Freed { texture, tiled, .. } in ready {
+        drop(texture);
+        drop(tiled);
+    }
+}
+
 /// Tiles taken: the heap, its place in the pool and the runs.
 type Taken = (ID3D12Heap, usize, Vec<(u32, u32)>);
 
@@ -178,6 +283,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<Taken> {
     if count == 0 || count > HEAP_TILES {
         return None;
     }
+    reap();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let index = match pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count)) {
         Some(index) => index,
@@ -224,8 +330,8 @@ fn take(device: &ID3D12Device, count: u32) -> Option<Taken> {
 
 /// Gives the runs `runs` of the heap at `index` back. A heap with every
 /// tile free goes back to the host GPU, unless it is the pool's only one.
-/// (Called when the host texture that held the tiles is dropped: no list
-/// that names it is left.)
+/// (Called when a [`Tiled`] is dropped: by [`reap`], once nothing holds the
+/// texture that had the tiles and its mappings have run.)
 fn give_back(index: usize, runs: &[(u32, u32)]) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(Some(h)) = pool.get_mut(index) else {
@@ -348,8 +454,9 @@ impl Tiled {
     /// none; the levels the host GPU packs together get theirs when any of
     /// them is named. To be called only where the levels given are written
     /// whole before a shader reads them (tiles hold what their last owner
-    /// left): the mapping goes on the host queue now, ahead of the lists
-    /// submitted after. Returns whether every level named has tiles (not
+    /// left), while a submission is prepared (`Host::execute`, which waits
+    /// for the mapping and says so with [`ran`]): the mapping goes on the
+    /// host queue now, ahead of that submission's lists. Returns whether every level named has tiles (not
     /// if no heap could be had).
     pub(crate) fn give(&self, texture: &ID3D12Resource, levels: u32) -> bool {
         match crate::host::host() {
@@ -420,6 +527,7 @@ impl Tiled {
                     D3D12_TILE_MAPPING_FLAG_NONE,
                 );
             }
+            QUEUED.fetch_add(1, Ordering::AcqRel);
             STATS[6].fetch_add(1, Ordering::Relaxed);
             STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             match level {
@@ -457,13 +565,15 @@ impl Tiled {
     }
 
     /// The bytes of the tiles it has now.
-    #[cfg(test)]
-    fn given_bytes(&self) -> u64 {
+    pub(crate) fn given_bytes(&self) -> u64 {
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         given.runs.iter().map(|run| u64::from(run.2) * TILE).sum()
     }
 }
 
+/// Gives every tile back to the pool (and a heap left empty to the host
+/// GPU): to be dropped only once no resource mapped to the tiles is held
+/// anywhere and their mappings have run ([`free`]).
 impl Drop for Tiled {
     fn drop(&mut self) {
         let given = self.given.get_mut().unwrap_or_else(|e| e.into_inner());
@@ -567,20 +677,122 @@ mod tests {
     /// pool when the texture is dropped.
     #[test]
     fn levels_take_tiles_when_given_and_give_them_back() {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU
+        let Some((host, texture)) = reserved() else {
+            return; // no host GPU with tier 2
         };
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
-        // SAFETY: a plain query into a structure of its own size.
-        let asked = unsafe {
-            host.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS,
-                (&raw mut options).cast(),
-                size_of_val(&options) as u32,
-            )
+        let tiled = Tiled::make(&host.device, &texture).expect("the host cuts it into tiles");
+        assert_eq!(tiled.every_level(), 0xfff);
+        assert_eq!(tiled.given_bytes(), 0);
+        assert!(!tiled.whole());
+        assert_eq!(tiled.without(0xfff), 0xfff);
+        // Level 0 of BC1 2048x2048: 2 MiB, 32 tiles.
+        let free_before = free_bytes();
+        assert!(tiled.give(&texture, 1));
+        assert_eq!(tiled.without(0xfff), 0xffe);
+        assert_eq!(tiled.given_bytes(), 32 * TILE);
+        // The pool's free bytes went down by what the level took (or a new
+        // heap came, with all but those tiles free).
+        let heap = u64::from(HEAP_TILES) * TILE;
+        let now = free_bytes() + 32 * TILE;
+        assert!(now == free_before || now == free_before + heap, "{now} {free_before}");
+        // The last level: packed with the other small ones on most hosts
+        // (giving it gives them all), its own standard level where the
+        // host packs nothing (WARP).
+        assert!(tiled.give(&texture, 1 << 11));
+        let packed_from = tiled.standard.len() as u32;
+        assert_eq!(tiled.without(0xfff), 0xffe & !(1 << 11) & ((1 << packed_from) - 1));
+        // Already given: nothing more is taken.
+        let bytes = tiled.given_bytes();
+        assert!(tiled.give(&texture, 1 | (1 << 11)));
+        assert_eq!(tiled.given_bytes(), bytes);
+        assert!(!tiled.whole(), "level 1 and up have none yet");
+        assert!(tiled.give(&texture, tiled.every_level()));
+        assert!(tiled.whole());
+        assert_eq!(tiled.without(0xfff), 0);
+        assert_eq!(tiled.given_bytes(), tiled.full);
+        // The mappings above are queued, not done: a submission waits for
+        // them before the tiles go back.
+        let id = windows::core::Interface::as_raw(&texture) as usize;
+        free(texture, tiled);
+        host.execute(&[]);
+        reap();
+        assert!(!freed(id), "nothing else holds it and its mappings ran: given back");
+    }
+
+    /// Whether the texture at `id` is let go of with its tiles not given
+    /// back yet.
+    fn freed(id: usize) -> bool {
+        let freed = FREED.lock().unwrap_or_else(|e| e.into_inner());
+        freed.iter().any(|f| windows::core::Interface::as_raw(&f.texture) as usize == id)
+    }
+
+    /// Whether any tile of `runs` (heap place, first tile, tiles) is free in
+    /// the pool, or its heap gone.
+    fn any_free(runs: &[(usize, u32, u32)]) -> bool {
+        let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        runs.iter().any(|&(index, start, tiles)| match pool.get(index) {
+            Some(Some(h)) => h.free.iter().any(|&(from, n)| from < start + tiles && start < from + n),
+            _ => true,
+        })
+    }
+
+    /// A texture let go of (its host texture dropped) keeps its tiles while
+    /// anything else holds its resource (a heap slot's view, a retired
+    /// copy, a list) and until the mappings queued for it have run: no
+    /// other texture is given them meanwhile, and their heap stays. Found
+    /// by fuzeofficlal's review: tiles went back at once, and a texture
+    /// made next was given them while a view of the old one lived.
+    #[test]
+    fn tiles_go_back_only_once_nothing_holds_the_texture_and_its_mappings_ran() {
+        let Some((host, texture)) = reserved() else {
+            return; // no host GPU with tier 2
         };
-        if asked.is_err() || options.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0 {
-            return;
+        // Held elsewhere (as `HostHeap::kept` or `host::retire` hold it).
+        let tiled = Tiled::make(&host.device, &texture).unwrap();
+        assert!(tiled.give(&texture, 1));
+        let runs = tiled.given.lock().unwrap().runs.clone();
+        let id = windows::core::Interface::as_raw(&texture) as usize;
+        let held = texture.clone();
+        free(texture, tiled);
+        host.execute(&[]);
+        reap();
+        assert!(freed(id), "held elsewhere: not given back");
+        assert!(!any_free(&runs), "its tiles are not free for another texture, its heap stays");
+        // Another texture given tiles now does not get them.
+        let (_, other) = reserved().unwrap();
+        let next = Tiled::make(&host.device, &other).unwrap();
+        assert!(next.give(&other, 1));
+        let taken = next.given.lock().unwrap().runs.clone();
+        assert!(
+            !taken.iter().any(|&(i, s, n)| runs.iter().any(|&(j, t, m)| i == j && s < t + m && t < s + n)),
+            "{taken:?} overlaps {runs:?}"
+        );
+        drop(held);
+        reap();
+        assert!(!freed(id), "nothing else holds it: given back");
+        free(other, next);
+
+        // Nothing else holds it, but its mapping has not run yet.
+        let (_, texture) = reserved().unwrap();
+        let tiled = Tiled::make(&host.device, &texture).unwrap();
+        let ran_before = RAN.load(Ordering::Acquire);
+        assert!(tiled.give(&texture, 1));
+        let id = windows::core::Interface::as_raw(&texture) as usize;
+        free(texture, tiled);
+        // (Another test's submission may have run the mapping meanwhile.)
+        if RAN.load(Ordering::Acquire) == ran_before {
+            assert!(freed(id), "its mapping is queued, not run: not given back");
+        }
+        host.execute(&[]);
+        assert!(!freed(id), "the submission waited for the mapping: given back");
+    }
+
+    /// A reserved 2048x2048 BC1 texture of twelve levels, where the host
+    /// GPU has tiled resources tier 2.
+    fn reserved() -> Option<(&'static crate::host::Host, ID3D12Resource)> {
+        let host = crate::host::host()?;
+        if tier(&host.device) < D3D12_TILED_RESOURCES_TIER_2.0 {
+            return None;
         }
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
@@ -597,37 +809,6 @@ mod tests {
         // SAFETY: a plain description and our out pointer.
         unsafe { host.device.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture) }
             .expect("a reserved texture");
-        let texture = texture.unwrap();
-        let tiled = Tiled::make(&host.device, &texture).expect("the host cuts it into tiles");
-        assert_eq!(tiled.every_level(), 0xfff);
-        assert_eq!(tiled.given_bytes(), 0);
-        assert!(!tiled.whole());
-        assert_eq!(tiled.without(0xfff), 0xfff);
-        // Level 0 of BC1 2048x2048: 2 MiB, 32 tiles.
-        assert!(tiled.give(&texture, 1));
-        assert_eq!(tiled.without(0xfff), 0xffe);
-        assert_eq!(tiled.given_bytes(), 32 * TILE);
-        // The last level: packed with the other small ones on most hosts
-        // (giving it gives them all), its own standard level where the
-        // host packs nothing (WARP).
-        assert!(tiled.give(&texture, 1 << 11));
-        let packed_from = tiled.standard.len() as u32;
-        assert_eq!(tiled.without(0xfff), 0xffe & !(1 << 11) & ((1 << packed_from) - 1));
-        // Already given: nothing more is taken.
-        let bytes = tiled.given_bytes();
-        assert!(tiled.give(&texture, 1 | (1 << 11)));
-        assert_eq!(tiled.given_bytes(), bytes);
-        assert!(!tiled.whole(), "level 1 and up have none yet");
-        assert!(tiled.give(&texture, tiled.every_level()));
-        assert!(tiled.whole());
-        assert_eq!(tiled.without(0xfff), 0);
-        assert_eq!(tiled.given_bytes(), tiled.full);
-        // The mappings above are queued, not done: an empty submission waits
-        // for them before the heaps go back (in the title, the list that
-        // used the texture holds it past them).
-        host.execute(&[]);
-        let heaps_before = STATS[3].load(Ordering::Relaxed);
-        drop(tiled);
-        assert!(STATS[3].load(Ordering::Relaxed) <= heaps_before);
+        Some((host, texture.unwrap()))
     }
 }

@@ -858,6 +858,13 @@ impl HostTexture {
         Self::counted(texture, state, castable, 0, Some(tiled))
     }
 
+    /// The video memory this texture holds now: its allocation, or for a
+    /// tiled one ([`HostTexture::tiled`], counted as 0 bytes) the tiles its
+    /// levels have. What eviction frees by giving it up.
+    pub(crate) fn held_bytes(&self) -> u64 {
+        self.tiled.as_ref().map_or(self.bytes, crate::tiles::Tiled::given_bytes)
+    }
+
     fn counted(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
         state: u32,
@@ -981,6 +988,11 @@ impl Drop for HostTexture {
     fn drop(&mut self) {
         if let Some(p) = self.placement.take() {
             crate::placement::free(self.texture.clone(), p);
+        }
+        // Its tiles likewise go back once nothing else holds the texture
+        // and their mappings have run.
+        if let Some(tiled) = self.tiled.take() {
+            crate::tiles::free(self.texture.clone(), tiled);
         }
         TEXTURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
@@ -1697,9 +1709,10 @@ pub(crate) fn evict_unused() {
         return;
     }
     let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
-        // Free space in the heaps of textures takes the card's memory but
-        // is not in use: new textures go there first.
-        let used = used - crate::placement::free_bytes() as f64 / 1e6;
+        // Free space in the heaps of textures, and free tiles in the pool of
+        // levels on demand, take the card's memory but are not in use: new
+        // textures and levels go there first.
+        let used = used - (crate::placement::free_bytes() + crate::tiles::free_bytes()) as f64 / 1e6;
         if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
     });
     evict(frame, now_ms(), over);
@@ -1739,7 +1752,7 @@ pub(crate) fn evict_among(
         }
     }
     let uses: Vec<(u64, u64, u64)> =
-        candidates.iter().map(|(t, _)| (t.last[0].load(Relaxed), t.last[1].load(Relaxed), t.bytes)).collect();
+        candidates.iter().map(|(t, _)| (t.last[0].load(Relaxed), t.last[1].load(Relaxed), t.held_bytes())).collect();
     let chosen = choose(&uses, frame, now, over);
     let gone: Vec<Owned> = chosen.into_iter().map(|i| candidates[i].clone()).collect();
     give_up(&gone, frame)
@@ -1802,7 +1815,7 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     let mut given = GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
     let given = given.get_or_insert_with(Default::default);
     given.retain(|_, &mut f| frame.saturating_sub(f) <= SOON_FRAMES);
-    let bytes = gone.iter().map(|(t, _)| t.bytes).sum();
+    let bytes = gone.iter().map(|(t, _)| t.held_bytes()).sum();
     for (t, owners) in gone {
         for &r in owners.iter().filter(|r| live.contains(r)) {
             let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());
@@ -2550,6 +2563,50 @@ mod tests {
         assert_eq!(slot::<Release>(target, 0x10)(target), 0);
         assert!(t.upgrade().is_none(), "freed with its title texture");
         assert_eq!(slot::<Release>(read, 0x10)(read), 0);
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+    }
+
+    /// Levels on demand (`crate::tiles`): a host copy recorded into a list
+    /// gives the texture's levels tiles when the list's submission is
+    /// prepared, not when it is recorded: a list dropped unrun leaves no
+    /// mapping queued (one queued for a texture that then went, its heap
+    /// with it, faulted the host GPU), and a submission made before it
+    /// sees no level with what the tiles' last owner left. Found by
+    /// fuzeofficlal's review.
+    #[cfg(windows)]
+    #[test]
+    fn a_host_write_gives_tiles_at_submission_not_when_recorded() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let h = heap(8 << 20);
+        let mut out = null;
+        // BC1 (71) 2048x2048, twelve levels: 2.7 MB, past the floor.
+        assert_eq!(create_placed(null, h, 0, &texture(2048, 2048, 71, 12), 0, null.cast(), &RESOURCE_IIDS[0], &mut out), S_OK);
+        crate::tiles::FORCED.with(|f| f.set(true));
+        let copy = host_copy(out);
+        crate::tiles::FORCED.with(|f| f.set(false));
+        let copy = copy.expect("a host texture");
+        if let Some(tiled) = &copy.tiled {
+            let every = tiled.every_level();
+            let list = host.new_list().unwrap();
+            crate::texture::host_writes(&list, out);
+            assert_eq!(tiled.without(every), every, "recorded: no level given tiles yet");
+            assert_eq!(tiled.given_bytes(), 0);
+            list.close();
+            drop(list);
+            assert_eq!(tiled.given_bytes(), 0, "dropped unrun: none given");
+            let list = host.new_list().unwrap();
+            crate::texture::host_writes(&list, out);
+            assert_eq!(tiled.given_bytes(), 0);
+            list.close();
+            host.execute(&[&list]);
+            assert!(tiled.whole(), "submitted: every level has tiles");
+            assert!(copy.host_written.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        drop(copy);
+        assert_eq!(slot::<Release>(out, 0x10)(out), 0);
         assert_eq!(slot::<Release>(h, 0x10)(h), 0);
     }
 
