@@ -1135,7 +1135,7 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        if crate::blind::skip(self.pipeline) {
+        if crate::blind::on() {
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -1253,7 +1253,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        if crate::blind::skip(self.pipeline) {
+        if crate::blind::on() {
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -1615,7 +1615,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        if crate::blind::skip(self.pipeline) {
+        if crate::blind::on() {
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -1722,7 +1722,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        if crate::blind::skip(self.pipeline) {
+        if crate::blind::on() {
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -1765,7 +1765,7 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
-        if crate::blind::skip(self.pipeline) {
+        if crate::blind::on() {
             return false;
         }
         // Skip before the argument clamp can mutate the indirect buffer.
