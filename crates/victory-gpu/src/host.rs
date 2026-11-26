@@ -3184,6 +3184,7 @@ impl Host {
     /// captures are on). `None` if nothing was shown; else, in diagnostics
     /// builds, whether the frame was black.
     pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
+        crate::blind::poll();
         self.present_with_compositor(
             planes,
             frame,
