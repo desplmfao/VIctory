@@ -1091,8 +1091,8 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches, 4 MiB by default.
-/// `VICTORY_LOOSE_WINDOW_KIB` (a power of two, 64 to 4096) sets a smaller
-/// size: lookups while Grand Theft Auto VI loads its world touched about
+/// `VICTORY_LOOSE_WINDOW_KIB` (any power of two) sets another size:
+/// lookups while Grand Theft Auto VI loads its world touched about
 /// 30% of the 4 MiB windows' bytes, so 256 KiB windows hold GBs less host
 /// memory, but in the open world they copied about ten times the bytes per
 /// frame and frames took longer.
@@ -1104,11 +1104,13 @@ fn window() -> u64 {
 }
 
 /// The window size `VICTORY_LOOSE_WINDOW_KIB` asks for, in bytes; 4 MiB
-/// when it is unset or not a power of two from 64 to 4096.
+/// when it is unset or not a power of two (sizes far from the default are
+/// the user's experiment).
 fn window_from(kib: Option<&str>) -> u64 {
     kib.and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|k| k.is_power_of_two() && (64..=4096).contains(k))
-        .map_or(4 << 20, |k| k << 10)
+        .filter(|k| k.is_power_of_two())
+        .and_then(|k| k.checked_mul(1 << 10))
+        .unwrap_or(4 << 20)
 }
 
 /// Copies of title memory outside buffers, by (start, length).
@@ -1885,12 +1887,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn window_sizes_are_powers_of_two_from_64_kib_to_4_mib() {
+    fn window_sizes_are_any_power_of_two() {
         assert_eq!(window_from(None), 4 << 20);
         assert_eq!(window_from(Some("256")), 256 << 10);
         assert_eq!(window_from(Some(" 64 ")), 64 << 10);
-        assert_eq!(window_from(Some("4096")), 4 << 20);
-        for bad in ["", "0", "32", "100", "8192", "-256", "256k", "0x100"] {
+        assert_eq!(window_from(Some("4")), 4 << 10);
+        assert_eq!(window_from(Some("16384")), 16 << 20);
+        for bad in ["", "0", "100", "-256", "256k", "0x100", "9223372036854775808"] {
             assert_eq!(window_from(Some(bad)), 4 << 20, "{bad:?}");
         }
     }
