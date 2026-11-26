@@ -127,9 +127,12 @@ pub(crate) fn skip(pipeline: usize) -> bool {
     if cut == u64::MAX {
         return false;
     }
+    // `CUT` is the tenth (0..=9): the same part of every frame, whatever
+    // its size.
     let width = (LAST_OPS.load(Ordering::Relaxed) / 10).max(1);
-    let dropped = n >= cut && n < cut + width;
-    if n == cut {
+    let from = cut * width;
+    let dropped = n >= from && n < from + width;
+    if n == from {
         AT_CUT.store(pipeline, Ordering::Relaxed);
     }
     if dropped && !NAMED.load(Ordering::Relaxed) {
@@ -178,21 +181,19 @@ pub fn keys(down: &[u8]) {
             DOWN[i].store(now, Ordering::Relaxed);
             continue;
         }
-        let total = LAST_OPS.load(Ordering::Relaxed).max(1);
-        let step = (total / 10).max(1);
         let cut = CUT.load(Ordering::Relaxed);
         let new = match (i, cut) {
             // Off: minus starts at the last tenth, plus at the first.
-            (0, u64::MAX) => total.saturating_sub(step),
+            (0, u64::MAX) => 9,
             (1, u64::MAX) => 0,
-            (0, c) => c.saturating_sub(step),
-            (1, c) if c.saturating_add(step) >= total => u64::MAX,
-            (1, c) => c + step,
+            (0, c) => c.saturating_sub(1),
+            (1, c) if c >= 9 => u64::MAX,
+            (1, c) => c + 1,
             _ => u64::MAX,
         };
         CUT.store(new, Ordering::Relaxed);
         NAMED.store(new == u64::MAX, Ordering::Relaxed);
-        tracing::warn!(cut = new, of = total, "VICTORY_FRAME_CUT: key");
+        tracing::warn!(tenth = new.wrapping_add(1), "VICTORY_FRAME_CUT: key");
     }
 }
 
@@ -205,9 +206,7 @@ pub(crate) fn caption() -> String {
     if cut == u64::MAX {
         return " | gap off".into();
     }
-    let total = LAST_OPS.load(Ordering::Relaxed).max(1);
-    let step = (total / 10).max(1);
-    format!(" | gap {}/10", (cut / step + 1).min(10))
+    format!(" | gap {}/10", cut + 1)
 }
 
 #[cfg(test)]
