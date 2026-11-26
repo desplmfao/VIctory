@@ -1,19 +1,36 @@
 //! The console's rectangle lists on the host. A rectangle comes as three
-//! corners in any order, and the hardware adds the fourth across the
-//! diagonal from the corner between the other two, for the position and
-//! every attribute: `a + b - c`, `c` the corner facing the longest side.
-//! Shaders differ: a full-screen rectangle can come as top left, bottom
-//! left, bottom right (`c` second), a blit or tile as top left, bottom left,
-//! top right (`c` first, as Mesa's own blits give them). The host has no
-//! such primitive; a geometry shader made for the vertex shader that feeds
-//! it takes each triangle `(v0, v1, v2)` and emits it with its completion
-//! `(a, b, v3)`, both turning the same way. Integer outputs (which can only
-//! be flat) keep `v0`'s value at the fourth corner.
+//! corners in any order (the blits put the right angle at `v1`, the tiled
+//! lighting at `v0`), and the hardware adds the fourth opposite the right
+//! angle `vc`, at `va + vb - vc`, for the position and every attribute. The
+//! host has no such primitive; a geometry shader made for the vertex shader
+//! that feeds it takes each triangle `(v0, v1, v2)`, finds the right angle
+//! opposite its longest side, and emits the triangle with its completion
+//! `(va, vb, v3)` (`va` before `vc`, `vb` after it), both turning the same
+//! way. Integer outputs (which can only be flat) keep `va`'s value at the
+//! fourth corner.
 
-use super::bitcode::{Attr, Bin, Term, pred};
+use super::bitcode::{Attr, Bin, Term, V, pred};
 use super::shader::Shader;
 use crate::ShaderError;
 use crate::dxbc::{Container, FourCC};
+
+/// Which of a rectangle's three corners (x and y of each) holds the right
+/// angle: the one opposite the longest side, else (ties, NaN) `1`. The
+/// geometry shader of [`rectangle_gs`] makes the same choice on the GPU.
+pub fn right_angle(xy: [[f32; 2]; 3]) -> usize {
+    let side = |i: usize, j: usize| {
+        let (dx, dy) = (xy[i][0] - xy[j][0], xy[i][1] - xy[j][1]);
+        dx * dx + dy * dy
+    };
+    let (d12, d20, d01) = (side(1, 2), side(2, 0), side(0, 1));
+    if d12 > d20 && d12 > d01 {
+        0
+    } else if d01 > d12 && d01 > d20 {
+        2
+    } else {
+        1
+    }
+}
 
 /// The geometry shader that completes the rectangles of the vertex shader
 /// container `vs` (its output signature is the shader's input and output).
@@ -49,78 +66,58 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
         }
         corners.push(values);
     }
-    // Which corner is between the other two: the one facing the longest
-    // side, in screen space. Without a position (or with ties, a degenerate
-    // rectangle) the second one.
-    let (first, third) = match elements
+    // The right angle, as [`right_angle`] picks it from the position.
+    let position = elements
         .iter()
-        .position(|e| e.kind == 3 && e.comp == 9 && e.cols >= 2)
-    {
-        Some(p) => {
-            let xy: Vec<_> = (0..3)
-                .map(|k| {
-                    let c = &corners[k][p];
-                    let (x, y) = (c[0], c[1]);
-                    if c.len() >= 4 {
-                        (
-                            s.m.bin(b, Bin::SDiv, x, c[3]),
-                            s.m.bin(b, Bin::SDiv, y, c[3]),
-                        )
-                    } else {
-                        (x, y)
-                    }
-                })
-                .collect();
-            let mut side = |i: usize, j: usize| {
-                let dx = s.m.bin(b, Bin::Sub, xy[i].0, xy[j].0);
-                let dy = s.m.bin(b, Bin::Sub, xy[i].1, xy[j].1);
-                let (xx, yy) = (s.m.bin(b, Bin::Mul, dx, dx), s.m.bin(b, Bin::Mul, dy, dy));
-                s.m.bin(b, Bin::Add, xx, yy)
-            };
-            let (d01, d02, d12) = (side(0, 1), side(0, 2), side(1, 2));
-            let mut longest = |d: _, e: _, f: _| {
-                let over_e = s.m.cmp(b, pred::OGT, d, e);
-                let over_f = s.m.cmp(b, pred::OGT, d, f);
-                s.m.bin(b, Bin::And, over_e, over_f)
-            };
-            (Some(longest(d12, d01, d02)), Some(longest(d01, d02, d12)))
-        }
-        None => (None, None),
-    };
-    // Corner k's value, picked by the corner between the others: the
-    // completion is `(a, b, a + b - c)`, `(v0, v2, ..)` when it is the
-    // second, `(v2, v1, ..)` when the first, `(v1, v0, ..)` when the third.
-    let pick = |m: &mut super::bitcode::Module, [if_first, if_second, if_third]: [_; 3]| {
-        let v = match third {
-            Some(t) => m.select(b, t, if_third, if_second),
-            None => if_second,
-        };
-        match first {
-            Some(f) => m.select(b, f, if_first, v),
-            None => v,
-        }
-    };
-    let mut completion: [Vec<Vec<_>>; 3] = Default::default();
-    for (id, e) in elements.iter().enumerate() {
-        let [mut a, mut bs, mut fourth] = [Vec::new(), Vec::new(), Vec::new()];
-        let columns = corners[0][id].iter().zip(&corners[1][id]).zip(&corners[2][id]);
-        for ((&v0, &v1), &v2) in columns.take(usize::from(e.cols)) {
-            let (va, vb) = (pick(&mut s.m, [v2, v0, v1]), pick(&mut s.m, [v1, v2, v0]));
-            a.push(va);
-            bs.push(vb);
-            fourth.push(if e.comp == 9 {
-                let c = pick(&mut s.m, [v0, v1, v2]);
-                let sum = s.m.bin(b, Bin::Add, va, vb);
-                s.m.bin(b, Bin::Sub, sum, c)
-            } else {
-                v0
+        .position(|e| e.kind == 3 && e.cols >= 2 && e.comp == 9)
+        .ok_or(ShaderError::Malformed("a rectangle list without a position"))?;
+    let side = |s: &mut Shader, i: usize, j: usize| {
+        let mut sum = None;
+        for (&p, &q) in corners[i][position].iter().zip(&corners[j][position]).take(2) {
+            let d = s.m.bin(b, Bin::Sub, p, q);
+            let sq = s.m.bin(b, Bin::Mul, d, d);
+            sum = Some(match sum {
+                Some(x) => s.m.bin(b, Bin::Add, x, sq),
+                None => sq,
             });
         }
-        completion[0].push(a);
-        completion[1].push(bs);
-        completion[2].push(fourth);
+        sum.expect("two columns")
+    };
+    let (d12, d20, d01) = (side(&mut s, 1, 2), side(&mut s, 2, 0), side(&mut s, 0, 1));
+    let longest = |s: &mut Shader, d: V, others: [V; 2]| {
+        let [x, y] = others.map(|o| s.m.cmp(b, pred::OGT, d, o));
+        s.m.bin(b, Bin::And, x, y)
+    };
+    let (at0, at2) = (longest(&mut s, d12, [d20, d01]), longest(&mut s, d01, [d12, d20]));
+    // `x0` if the right angle is at v0, `x2` if at v2, else `x1`.
+    let pick = |s: &mut Shader, [x0, x1, x2]: [V; 3]| {
+        let x = s.m.select(b, at2, x2, x1);
+        s.m.select(b, at0, x0, x)
+    };
+    // The completing triangle (va, vb, v3), element by element.
+    let mut second: [Vec<Vec<V>>; 3] = Default::default();
+    for (id, e) in elements.iter().enumerate() {
+        let mut cols: [Vec<V>; 3] = Default::default();
+        let [c0, c1, c2] = [0, 1, 2].map(|k| &corners[k][id]);
+        for ((&v0, &v1), &v2) in c0.iter().zip(c1).zip(c2) {
+            let va = pick(&mut s, [v2, v0, v1]);
+            let vb = pick(&mut s, [v1, v2, v0]);
+            let v3 = if e.comp == 9 {
+                let vc = pick(&mut s, [v0, v1, v2]);
+                let sum = s.m.bin(b, Bin::Add, va, vb);
+                s.m.bin(b, Bin::Sub, sum, vc)
+            } else {
+                va
+            };
+            for (k, v) in [va, vb, v3].into_iter().enumerate() {
+                cols[k].push(v);
+            }
+        }
+        for (k, c) in cols.into_iter().enumerate() {
+            second[k].push(c);
+        }
     }
-    corners.extend(completion);
+    corners.extend(second);
     for triangle in [[0, 1, 2], [3, 4, 5]] {
         for k in triangle {
             for (id, e) in elements.iter().enumerate() {
@@ -141,6 +138,25 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
     s.outputs = elements;
     s.m.terminate(b, Term::Ret);
     Ok(s.finish())
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::right_angle;
+
+    /// The right angle is found wherever it is; triangles that are no
+    /// rectangle's take the corner opposite their longest side (their
+    /// widest angle), and ties and NaN keep the blits' corner, `v1`.
+    #[test]
+    fn right_angles_are_found_in_any_order() {
+        let (tl, bl, br, tr) = ([0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]);
+        assert_eq!(right_angle([tl, bl, br]), 1);
+        assert_eq!(right_angle([tl, bl, tr]), 0);
+        assert_eq!(right_angle([bl, tr, tl]), 2);
+        assert_eq!(right_angle([[0.0, 0.0], [3.0, 1.0], [1.0, 0.0]]), 2, "obtuse at v2");
+        assert_eq!(right_angle([tl, tl, tl]), 1, "a point");
+        assert_eq!(right_angle([tl, [f32::NAN, 0.0], br]), 1);
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -208,36 +224,14 @@ mod tests {
         s.finish()
     }
 
-    /// One rectangle (top left, bottom left, bottom right) with a
-    /// coordinate attribute: every pixel of the square is drawn, the
-    /// attribute interpolated over it, the top-right half included.
+    /// One rectangle with a coordinate attribute, its right angle at each of
+    /// the three corners in turn (the blits' top left, bottom left, bottom
+    /// right; the tiled lighting's top left, bottom left, top right; and
+    /// one with it last): every pixel of the square is drawn, the attribute
+    /// interpolated over it, the missing half included. Three corners on one
+    /// line draw nothing.
     #[test]
     fn rectangles_get_their_fourth_corner() {
-        // The corner between the other two second.
-        draws_the_square(&[[-0.5, 0.5], [-0.5, -0.5], [0.5, -0.5]]);
-    }
-
-    /// Tiles and blits give the corners as top left, bottom left, top
-    /// right: the corner between the others first, its fourth the bottom
-    /// right. Completed across the wrong diagonal (`v0 + v2 - v1`), the
-    /// second triangle lands on the square above, and the bottom-right half
-    /// is never drawn.
-    #[test]
-    fn rectangles_with_the_corner_first_complete_across_their_diagonal() {
-        draws_the_square(&[[-0.5, 0.5], [-0.5, -0.5], [0.5, 0.5]]);
-    }
-
-    /// The corner between the others third (top right, bottom left, top
-    /// left): the fourth is the bottom right as well.
-    #[test]
-    fn rectangles_with_the_corner_third_complete_across_their_diagonal() {
-        draws_the_square(&[[0.5, 0.5], [-0.5, -0.5], [-0.5, 0.5]]);
-    }
-
-    /// Draws one rectangle of the given corners (clip x, y; the attribute
-    /// is the same x, y) into 32x32 and checks every pixel: the square
-    /// `|x|, |y| < 0.5` holds its coordinates, the rest nothing.
-    fn draws_the_square(corners: &[[f32; 2]; 3]) {
         let (vs, ps) = (shader(false), shader(true));
         let gs = super::rectangle_gs(&vs).unwrap();
         if let Ok(mut v) =
@@ -247,31 +241,33 @@ mod tests {
                 v.validate(&mut c.clone()).unwrap();
             }
         }
-        let vertices: Vec<f32> = corners
-            .iter()
-            .flat_map(|&[x, y]| [x, y, 0.5, 1.0, x, y])
-            .collect();
+        let corner = |x: f32, y: f32| [x, y, 0.5, 1.0, x, y];
+        let (tl, bl, br, tr) = (corner(-0.5, 0.5), corner(-0.5, -0.5), corner(0.5, -0.5), corner(0.5, 0.5));
+        let orders = [[tl, bl, br], [tl, bl, tr], [bl, tr, tl], [tl, corner(0.0, 0.0), br]];
         for warp in [false, true] {
             let Ok(host) = Host::new(warp) else { continue };
             let root = host.root_signature_for(&[]).unwrap();
             let pso = host.pipeline_gs(&root, &vs, &gs, &ps).unwrap();
-            let draw = Draw {
-                roots: Vec::new(),
-                textures: &[],
-                samplers: &[],
-                vertices: &vertices,
-                stride: 24,
-                size: (32, 32),
-                mesh_groups: 0,
-            };
-            let texels = host.draw(&root, &pso, &draw).unwrap();
-            for (i, t) in texels.iter().enumerate() {
-                let (x, y) = ((i % 32) as f32, (i / 32) as f32);
-                let (u, v) = ((x + 0.5) / 16.0 - 1.0, 1.0 - (y + 0.5) / 16.0);
-                let inside = u.abs() < 0.5 && v.abs() < 0.5;
-                let want = if inside { [u, v, 1.0, 1.0] } else { [0.0; 4] };
-                let near = t.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4);
-                assert!(near, "warp {warp} pixel ({x}, {y}): {t:?}, want {want:?}");
+            for (n, order) in orders.iter().enumerate() {
+                let vertices = order.concat();
+                let draw = Draw {
+                    roots: Vec::new(),
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &vertices,
+                    stride: 24,
+                    size: (32, 32),
+                    mesh_groups: 0,
+                };
+                let texels = host.draw(&root, &pso, &draw).unwrap();
+                for (i, t) in texels.iter().enumerate() {
+                    let (x, y) = ((i % 32) as f32, (i / 32) as f32);
+                    let (u, v) = ((x + 0.5) / 16.0 - 1.0, 1.0 - (y + 0.5) / 16.0);
+                    let inside = n < 3 && u.abs() < 0.5 && v.abs() < 0.5;
+                    let want = if inside { [u, v, 1.0, 1.0] } else { [0.0; 4] };
+                    let near = t.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4);
+                    assert!(near, "warp {warp} order {n} pixel ({x}, {y}): {t:?}, want {want:?}");
+                }
             }
         }
     }

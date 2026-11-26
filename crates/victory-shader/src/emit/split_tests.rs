@@ -385,6 +385,14 @@ fn lane_writes_reach_lanes_outside_the_branch() {
         0x0001_5009, // v_writelane_b32 v2, s9, 40
         0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
     ];
+    // The written VGPR is read as a vector after the join, so the lane
+    // write must still be emulated on a 32-lane host.
+    let wave32 = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let cs = emit_for(&program(&body, 64), wave32).unwrap();
+    assert_eq!(wave_size(&cs.dxil), Some(32));
     console_flow_case("if (lane < 20) writelane(40, 77)", &body, 64, |t| {
         if t == 40 { 77 } else { 1 }
     });
@@ -1261,4 +1269,71 @@ fn selects_on_constant_masks_beside_in_half_reads() {
         |t| if t == 0 || t == 2 { t } else { t ^ 16 },
         true,
     );
+}
+
+/// The lane writes are SGPR spills. The restore after the branch has
+/// two incoming VGPR values, but both hold the same scalar in lane 40.
+#[test]
+fn sgpr_spills_across_a_divergent_branch_stay_per_lane() {
+    let body = [
+        0xD761_0005,
+        0x0001_5008, // v_writelane_b32 v5, s8, 40
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0005, // s_cbranch_execz +5
+        0xD761_0005,
+        0x0001_0001, // v_writelane_b32 v5, s1, 0
+        0xD760_0009,
+        0x0001_5105, // v_readlane_b32 s9, v5, 40
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0xD760_0009,
+        0x0001_5105, // v_readlane_b32 s9, v5, 40
+        0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+    ];
+    let p = program(&body, 64);
+    let wave32 = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    // Main's per-lane form: the console's wave size where the host runs it
+    // (the lane writes emulated), none on a 32-lane host. Both are the
+    // first pass's: it does not ask for the console flow.
+    let code = crate::ir::build(&p.code, p.wave64, p.vgprs).unwrap();
+    let st = crate::structure::structure(&code).unwrap();
+    let res = crate::resource::track(&code, &p.layout, p.stage, Some(&st)).unwrap();
+    let io = crate::io::raise(&code, &p).unwrap();
+    for (target, want) in [(super::Target::ANY, Some(64)), (wave32, None)] {
+        let cs = emit_for(&p, target).unwrap();
+        assert_eq!(wave_size(&cs.dxil), want, "{target:?}");
+        let per_lane = super::lower::lower(&super::lower::Parts {
+            native: &p,
+            p: &code,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            target,
+            console_cf: false,
+            per_lane_only: false,
+            view_marks: false,
+        })
+        .unwrap_or_else(|e| panic!("{target:?}: {e}"));
+        assert_eq!(per_lane.dxil, cs.dxil, "{target:?}");
+    }
+    let Ok(warp) = Host::new(true) else {
+        return;
+    };
+    let out = run(&warp, &p, 2).unwrap();
+    let want: Vec<_> = (0..2)
+        .flat_map(|group| {
+            let offset = group * 64 * 4;
+            (0..64).map(move |lane| offset + if lane < 20 { offset } else { 1 })
+        })
+        .collect();
+    assert_eq!(out, want);
 }

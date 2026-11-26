@@ -16,17 +16,20 @@
 //! before, but none has memory. A level is given 64 KiB tiles of a heap of
 //! ours (`UpdateTileMappings`, on the host queue) when its title memory is
 //! mapped, at the refresh of the texture's staging buffer at submission
-//! (`texture.rs` `Staging::refresh`): the refresh runs before the lists of
-//! the submission are executed, and every list that samples the texture
-//! copies every level from the staging buffer, so a level is written whole
-//! before a shader reads it. A level without tiles reads as zeros (tiled
-//! resources tier 2), as the zeros the upload of unmapped memory left
-//! before. Before the host GPU itself writes the texture (a copy, a
-//! resolve), every level is given tiles, after an upload of what the title
-//! holds is recorded (`texture.rs` `host_written`).
+//! (`texture.rs` `Staging::refresh`): the refresh runs before the
+//! submission's upload list is recorded and its lists are executed, and a
+//! level just given tiles is detiled and uploaded whole by that list
+//! whether its bytes changed or not (an upload otherwise copies only the
+//! subresources that changed), so a level is written whole before a shader
+//! reads it. A level without tiles reads as zeros (tiled resources tier 2),
+//! as the zeros the upload of unmapped memory left before. Before the host
+//! GPU itself writes the texture (a copy, a resolve), every level is given
+//! tiles, and the levels just given are uploaded from what the title holds
+//! by the upload list of the submission that runs the write, ahead of it
+//! (`texture.rs` `host_writes`).
 //!
 //! shortcut: tiles are not taken back while the host texture lives; a level
-//! the title unmaps keeps them (the upload writes it with zeros). They go
+//! the title unmaps keeps them (and what was last uploaded). They go
 //! back with the host texture.
 //! shortcut: views are not clamped to the first level with memory: a
 //! level the title does not hold reads as zeros, as before.
@@ -438,9 +441,9 @@ impl Tiled {
         all
     }
 
-    /// Of `levels`, the ones that have no tiles now.
-    #[cfg(test)]
-    fn without(&self, levels: u32) -> u32 {
+    /// Of `levels`, the ones that have no tiles now (the levels the host
+    /// GPU packs together count as one: all or none).
+    pub(crate) fn without(&self, levels: u32) -> u32 {
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         let first_packed = self.standard.len() as u32;
         let mut without = 0;
