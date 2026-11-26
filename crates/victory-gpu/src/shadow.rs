@@ -996,6 +996,11 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The longest title buffer registered so far (it stays after the buffer is
+/// released): a buffer starting further below an address than this cannot
+/// hold it. Changed under `BUFFERS`' lock.
+static MAX_SPAN: AtomicU64 = AtomicU64::new(0);
+
 /// Counts copies made and title buffers released: [`all`] may differ when
 /// it changed.
 static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1008,11 +1013,6 @@ pub(crate) fn generation() -> u64 {
 fn changed() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
-
-/// The longest title buffer registered so far (it stays after the buffer is
-/// released): a buffer starting further below an address than this cannot
-/// hold it. Changed under `BUFFERS`' lock.
-static MAX_SPAN: AtomicU64 = AtomicU64::new(0);
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
@@ -1090,14 +1090,26 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
-/// gets copies of the aligned windows it touches. A window is 256 KiB:
-/// lookups while Grand Theft Auto VI loads its world touched about 30% of
-/// the 4 MiB windows this used to copy, so most of their bytes (GBs of host
-/// memory) were never asked for; smaller windows cost more of them, each a
-/// host buffer and a page-table entry.
+/// gets copies of the aligned windows it touches, 4 MiB by default.
+/// `VICTORY_LOOSE_WINDOW_KIB` (a power of two, 64 to 4096) sets a smaller
+/// size: lookups while Grand Theft Auto VI loads its world touched about
+/// 30% of the 4 MiB windows' bytes, so 256 KiB windows hold GBs less host
+/// memory, but in the open world they copied about ten times the bytes per
+/// frame and frames took longer.
 /// shortcut: copies of windows are never freed; key them to the title's
 /// allocations if memory use grows.
-const WINDOW: u64 = 256 << 10;
+fn window() -> u64 {
+    static WINDOW: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| window_from(std::env::var("VICTORY_LOOSE_WINDOW_KIB").ok().as_deref()))
+}
+
+/// The window size `VICTORY_LOOSE_WINDOW_KIB` asks for, in bytes; 4 MiB
+/// when it is unset or not a power of two from 64 to 4096.
+fn window_from(kib: Option<&str>) -> u64 {
+    kib.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|k| k.is_power_of_two() && (64..=4096).contains(k))
+        .map_or(4 << 20, |k| k << 10)
+}
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
@@ -1125,13 +1137,14 @@ fn enclosing_window<V>(windows: &BTreeMap<(u64, u64), V>, span: u64, address: u6
 /// The window copy for `[address, end)` outside buffers: one already made
 /// that holds it (a range spanning two windows has one of its own, which
 /// later ranges in it share), else a new one. None for memory that is not
-/// committed (a stale or null address): 4 MiB of zeros would not help.
+/// committed (a stale or null address): a window of zeros would not help.
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if address < LOWEST_MAPPED {
         return None;
     }
-    let start = address & !(WINDOW - 1);
-    let len = end.checked_next_multiple_of(WINDOW)? - start;
+    let window = window();
+    let start = address & !(window - 1);
+    let len = end.checked_next_multiple_of(window)? - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), address, end) {
         return Some(shadow.clone());
@@ -1802,7 +1815,7 @@ pub(crate) mod tests {
 
     #[test]
     fn loose_windows_are_reused_for_ranges_inside_them() {
-        let w = WINDOW;
+        let w = window();
         let base = 0x20_0000_0000;
         let mut windows = BTreeMap::new();
         windows.insert((base, w), "first");
@@ -1836,7 +1849,7 @@ pub(crate) mod tests {
         if host().is_none() {
             return;
         }
-        let w = WINDOW as usize;
+        let w = window() as usize;
         // SAFETY: a fresh allocation, released below.
         let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * w, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
         assert_ne!(p, 0);
@@ -1872,6 +1885,17 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn window_sizes_are_powers_of_two_from_64_kib_to_4_mib() {
+        assert_eq!(window_from(None), 4 << 20);
+        assert_eq!(window_from(Some("256")), 256 << 10);
+        assert_eq!(window_from(Some(" 64 ")), 64 << 10);
+        assert_eq!(window_from(Some("4096")), 4 << 20);
+        for bad in ["", "0", "32", "100", "8192", "-256", "256k", "0x100"] {
+            assert_eq!(window_from(Some(bad)), 4 << 20, "{bad:?}");
+        }
+    }
+
+    #[test]
     fn loose_memory_must_be_committed() {
         use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         // The null page and its guard area.
@@ -1880,7 +1904,7 @@ pub(crate) mod tests {
         assert!(loose(LOWEST_MAPPED - 1, LOWEST_MAPPED + 1).is_none());
         // Reserved, not committed.
         // SAFETY: a fresh reservation, released below.
-        let p = unsafe { VirtualAlloc(std::ptr::null(), WINDOW as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
+        let p = unsafe { VirtualAlloc(std::ptr::null(), window() as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
         assert_ne!(p, 0);
         assert!(loose(p + 64, p + 128).is_none());
         // SAFETY: our reservation.
