@@ -7,8 +7,14 @@
 //! own frames, not of ours: the intro before the prologue passes in a
 //! fraction of the time. Without the variable nothing changes and F9 does
 //! nothing.
+//!
+//! Frame cut (testing aid): with `VICTORY_FRAME_CUT=1` each frame runs only
+//! its first N draws and dispatches (in submission order) and drops the
+//! rest. F10 moves the cut 10% of the last frame earlier, F11 later, F12
+//! turns it off (all run). Each change logs the cut and the pipeline at it:
+//! moving it until a wrong layer disappears names the pass that draws it.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Drawing is cut down now.
 static BLIND: AtomicBool = AtomicBool::new(false);
@@ -56,6 +62,7 @@ pub(crate) fn drawn() -> bool {
 /// Once a frame (at present): picks whether the next frame is drawn; F9
 /// toggles.
 pub(crate) fn poll() {
+    poll_cut();
     if !wanted() {
         return;
     }
@@ -74,6 +81,94 @@ pub(crate) fn poll() {
             tracing::warn!(blind = now, "VICTORY_BLIND: F9");
         } else if !down {
             DOWN.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+
+/// Frame cut: ops run this frame, ops of the last frame, and the cut
+/// (`u64::MAX`: none).
+static OPS: AtomicU64 = AtomicU64::new(0);
+static LAST_OPS: AtomicU64 = AtomicU64::new(0);
+static CUT: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The pipeline at the cut in the last frame, to name it once.
+static AT_CUT: AtomicUsize = AtomicUsize::new(0);
+static NAMED: AtomicBool = AtomicBool::new(true);
+
+fn cut_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_FRAME_CUT").is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("VICTORY_FRAME_CUT: F10 cuts each frame 10% earlier, F11 later, F12 off");
+        }
+        on
+    })
+}
+
+/// Whether the draw or dispatch with `pipeline` (the title's object) is
+/// dropped: blind frames, or past the frame cut.
+#[inline]
+pub(crate) fn skip(pipeline: usize) -> bool {
+    if on() {
+        return true;
+    }
+    let cut = CUT.load(Ordering::Relaxed);
+    if cut == u64::MAX {
+        return false;
+    }
+    let n = OPS.fetch_add(1, Ordering::Relaxed);
+    if n == cut {
+        AT_CUT.store(pipeline, Ordering::Relaxed);
+    }
+    n >= cut
+}
+
+/// At present: frame cut keys and bookkeeping.
+fn poll_cut() {
+    if !cut_wanted() {
+        return;
+    }
+    let ops = OPS.swap(0, Ordering::Relaxed);
+    if CUT.load(Ordering::Relaxed) == u64::MAX {
+        LAST_OPS.store(ops, Ordering::Relaxed);
+    } else {
+        LAST_OPS.store(LAST_OPS.load(Ordering::Relaxed).max(ops), Ordering::Relaxed);
+    }
+    if !NAMED.swap(true, Ordering::Relaxed) {
+        let at = AT_CUT.load(Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let shaders = crate::pipeline::shaders_of(at as crate::object::This);
+        #[cfg(not(feature = "diagnostics"))]
+        let shaders = format!("{at:#x}");
+        tracing::warn!(cut = CUT.load(Ordering::Relaxed), of = LAST_OPS.load(Ordering::Relaxed), at_cut = %shaders, "VICTORY_FRAME_CUT");
+    }
+    #[cfg(windows)]
+    {
+        static DOWN: [AtomicBool; 3] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
+        for (i, key) in [0x79, 0x7A, 0x7B].into_iter().enumerate() {
+            // SAFETY: a plain query.
+            let down = unsafe { GetAsyncKeyState(key) } < 0;
+            if !down {
+                DOWN[i].store(false, Ordering::Relaxed);
+                continue;
+            }
+            if DOWN[i].swap(true, Ordering::Relaxed) {
+                continue;
+            }
+            let total = LAST_OPS.load(Ordering::Relaxed).max(1);
+            let step = (total / 10).max(1);
+            let cut = CUT.load(Ordering::Relaxed);
+            let new = match i {
+                0 => cut.min(total).saturating_sub(step),
+                1 => cut.min(total).saturating_add(step).min(total),
+                _ => u64::MAX,
+            };
+            CUT.store(new, Ordering::Relaxed);
+            NAMED.store(new == u64::MAX, Ordering::Relaxed);
+            if new == u64::MAX {
+                tracing::warn!("VICTORY_FRAME_CUT: off");
+            }
         }
     }
 }
