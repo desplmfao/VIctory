@@ -445,10 +445,6 @@ impl Hub {
             let scripted: [KeyState; 0] = [];
             (pads, source.keys(), scripted)
         };
-        #[cfg(windows)]
-        if !keys.is_empty() || pads.iter().flatten().any(|p| p.buttons != 0) {
-            super::clock::player_input();
-        }
         let events = self.state().poll(&self.devices, pads, keys, &scripted);
         self.deliver(events);
     }

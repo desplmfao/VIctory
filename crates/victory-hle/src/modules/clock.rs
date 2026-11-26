@@ -3,11 +3,8 @@
 //! `VICTORY_CLOCK_SCALE=<n>` makes the title's clock run `n` times faster
 //! for the first `VICTORY_CLOCK_SCALE_SECS` real seconds (180 by default),
 //! then at the normal rate from where it got to: the intro cutscenes, which
-//! run at one or two frames a second here, pass in seconds. The first real
-//! key or button the player presses (not `VICTORY_KEYS`) ends the fast
-//! stretch at once: leave the controls alone until you want to play.
-//! Without the variable nothing is overridden and the title reads the
-//! host's clock.
+//! run at one or two frames a second here, pass in seconds. Without the
+//! variable nothing is overridden and the title reads the host's clock.
 //!
 //! Covers what Grand Theft Auto VI reads its time from:
 //! `QueryPerformanceCounter` (`api-ms-win-core-profile-l1-1-0`) and
@@ -18,7 +15,6 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::{HleModule, hle_export};
 
@@ -68,26 +64,9 @@ fn fast() -> Option<&'static Fast> {
     .as_ref()
 }
 
-/// The host counter when the player first pressed something (`i64::MAX`
-/// until then).
-static TOUCHED: AtomicI64 = AtomicI64::new(i64::MAX);
-
-/// The player pressed a key or button (gameinput's poll): the fast stretch
-/// ends now.
-pub(crate) fn player_input() {
-    if TOUCHED.load(Ordering::Relaxed) == i64::MAX && fast().is_some() {
-        let mut t = 0;
-        // SAFETY: an output of ours.
-        unsafe { host_counter(&raw mut t) };
-        if TOUCHED.compare_exchange(i64::MAX, t, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-            tracing::warn!("VICTORY_CLOCK_SCALE: player input, the title's clock runs at the normal rate from now");
-        }
-    }
-}
-
 /// Host counter value `t` as the title sees it.
 fn scaled(f: &Fast, t: i64) -> i64 {
-    scaled_until(f, t, f.until.min(TOUCHED.load(Ordering::Relaxed)))
+    scaled_until(f, t, f.until)
 }
 
 fn scaled_until(f: &Fast, t: i64, until: i64) -> i64 {
@@ -150,7 +129,7 @@ mod tests {
         assert_eq!(s(2_000), 1_000 + 1_000 * 100);
         assert_eq!(s(2_010), 1_000 + 1_000 * 100 + 10);
         assert!(s(2_001) > s(2_000));
-        // Ended early by the player at 1_200.
+        // A stretch ending earlier.
         assert_eq!(scaled_until(&f, 1_500, 1_200), 1_000 + 200 * 100 + 300);
     }
 
