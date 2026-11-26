@@ -1,7 +1,6 @@
 //! Blind frames (testing aid): with `VICTORY_BLIND=<n>` the run starts
 //! drawing only every `n`th frame (`1`: none; draws, dispatches and indirect
-//! executions of the other frames are dropped, and those frames are not
-//! shown; copies go on),
+//! executions of the other frames are dropped; copies and presents go on),
 //! and F9 toggles between that and drawing every frame. A title
 //! that advances its cutscenes per frame then plays them at the speed of its
 //! own frames, not of ours: the intro before the prologue passes in a
@@ -45,12 +44,6 @@ pub(crate) fn on() -> bool {
 #[link(name = "user32")]
 unsafe extern "system" {
     fn GetAsyncKeyState(key: i32) -> i16;
-}
-
-/// Whether the frame now presented was drawn (a frame not drawn is not
-/// shown: the window keeps the last drawn one instead of a blank frame).
-pub(crate) fn drawn() -> bool {
-    !on()
 }
 
 /// Once a frame (at present): picks whether the next frame is drawn; F9
