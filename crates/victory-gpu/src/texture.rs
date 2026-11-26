@@ -235,11 +235,15 @@ unsafe impl Sync for Staging {}
 /// get its upload.
 ///
 /// A host texture made level by level (`crate::tiles`) gets tiles for every
-/// level now (the mapping goes on the host queue ahead of the submission)
-/// and the upload of what the title holds into the levels just given, by
-/// the submission's upload list ahead of `list`: the host's write lands
+/// level when that submission is prepared ([`give_for_host_writes`]), and
+/// the upload of what the title holds into the levels just given, by the
+/// submission's upload list ahead of `list`: the host's write lands
 /// whatever level it names, and what it does not cover is the title's data
-/// or zeros, not what the tiles' last owner left.
+/// or zeros, not what the tiles' last owner left. Not when `list` is
+/// recorded: a list reset or dropped unrun would leave a mapping queued for
+/// a texture that may go (and its heap with it) meanwhile, and a submission
+/// made before `list`'s would see the levels just given with what the
+/// tiles' last owner left.
 pub(crate) fn host_writes(list: &HostList, resource: This) {
     use std::sync::atomic::Ordering::Relaxed;
     let Some(copy) = crate::resource::host_copy(resource) else {
@@ -249,18 +253,35 @@ pub(crate) fn host_writes(list: &HostList, resource: This) {
         && !copy.host_written.load(Relaxed)
         && !tiled.whole()
     {
-        let every = tiled.every_level();
-        let before = tiled.without(every);
-        tiled.give(&copy.texture, every);
-        let given = before & !tiled.without(every);
-        if given != 0
-            && let Some(staging) = staging(resource, &copy.texture)
-        {
-            staging.pending.fetch_or(given, Relaxed);
+        let staging = staging(resource, &copy.texture);
+        list.defer_tiles(copy.clone(), staging.clone());
+        if staging.is_some() {
             upload(list, resource, &copy.texture);
         }
     }
     list.defer_host(move || copy.host_written.store(true, Relaxed));
+}
+
+/// Levels on demand, at the preparation of a submission whose lists host
+/// copies or resolves write `copy` (`host_writes`), ahead of its upload
+/// list: every level gets tiles, and those just given are owed an upload
+/// (`staging`'s `pending`), which that upload list records.
+pub(crate) fn give_for_host_writes(copy: &crate::resource::HostTexture, staging: Option<&Staging>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(tiled) = &copy.tiled else {
+        return;
+    };
+    // A submission made before this one wrote it: every level had tiles.
+    if copy.host_written.load(Relaxed) || tiled.whole() {
+        return;
+    }
+    let every = tiled.every_level();
+    let before = tiled.without(every);
+    tiled.give(&copy.texture, every);
+    let given = before & !tiled.without(every);
+    if let Some(staging) = staging {
+        staging.pending.fetch_or(given, Relaxed);
+    }
 }
 
 fn is_host_written(resource: This) -> bool {
@@ -675,7 +696,19 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
             return (bytes, buffer.map(|(b, at)| (b, at, fresh)));
         }
-        if !committed(self.memory, size) {
+        // Levels on demand, the memory partly mapped (streamed levels not in
+        // yet): read through the copy, zeros where unmapped, as the tracked
+        // path above does, so the levels the title holds get their tiles and
+        // bytes like a fully mapped texture's (`give_held` below). Not
+        // zeros for all, which would leave the mapped levels without tiles
+        // until every level is mapped.
+        let mut scratch = None;
+        let whole = committed(self.memory, size);
+        if !whole && self.on_demand.is_some() {
+            let s = scratch.insert(Scratch::take(size));
+            crate::host::copy_mapped(s.0.as_mut_ptr(), self.memory, size, false);
+        }
+        if !whole && scratch.is_none() {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -684,8 +717,7 @@ impl Staging {
                 "a sampled texture's memory is not committed"
             );
             // Never uploaded: zeros, as a committed texture starts (one in
-            // a heap of textures starts with whatever the range held). Levels
-            // on demand given tiles since (`host_writes`) take zeros too.
+            // a heap of textures starts with whatever the range held).
             let pending = self.pending.swap(0, std::sync::atomic::Ordering::Relaxed);
             if last.hash.is_some() && pending == 0 {
                 return (0, None);
@@ -699,8 +731,11 @@ impl Staging {
             }
             return (0, buffer.map(|(b, at)| (b, at, every)));
         }
-        // SAFETY: committed memory of the texture's layout size.
-        let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        let tiled = match &scratch {
+            Some(s) => &s.0[..size],
+            // SAFETY: committed memory of the texture's layout size.
+            None => unsafe { std::slice::from_raw_parts(self.memory, size) },
+        };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
