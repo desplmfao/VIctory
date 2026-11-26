@@ -149,8 +149,17 @@ fn poll_cut() {
     if !cut_wanted() {
         return;
     }
-    // Every draw and dispatch is counted, cut or not: the frame's size.
-    LAST_OPS.store(OPS.swap(0, Ordering::Relaxed), Ordering::Relaxed);
+    // Every draw and dispatch is counted, cut or not. The frame's size is
+    // the largest of the last 16 present intervals: the title presents
+    // between scene frames too (a dozen draws or none), and a tenth of those
+    // would drop nothing.
+    static RECENT: std::sync::Mutex<[u64; 16]> = std::sync::Mutex::new([0; 16]);
+    static AT: AtomicUsize = AtomicUsize::new(0);
+    let ops = OPS.swap(0, Ordering::Relaxed);
+    let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    recent[AT.fetch_add(1, Ordering::Relaxed) % 16] = ops;
+    LAST_OPS.store(recent.iter().copied().max().unwrap_or(0), Ordering::Relaxed);
+    drop(recent);
     if !NAMED.swap(true, Ordering::Relaxed) {
         let gap = std::mem::take(&mut *IN_GAP.lock().unwrap_or_else(|e| e.into_inner()));
         #[cfg(feature = "diagnostics")]
