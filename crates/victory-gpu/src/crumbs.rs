@@ -263,8 +263,11 @@ pub(crate) fn progress(ids: &[u32], started: u32, finished: u32) -> Progress {
     if started < first || started > last {
         return Progress::NotStarted;
     }
-    // The first not finished: after `finished` if it is one of ours.
-    let first = if finished >= first { ids.partition_point(|&id| id <= finished) } else { 0 };
+    // The first not finished: after `finished` if it is one of ours. A
+    // `finished` past our last id is not ours: another list sharing the
+    // slot (slots repeat every `SLOTS` ids) or ids that wrapped wrote it,
+    // and nothing of this list is known to have finished.
+    let first = if finished >= first && finished < last { ids.partition_point(|&id| id <= finished) } else { 0 };
     let in_flight = ids[first..].partition_point(|&id| id <= started);
     Progress::Stuck { first, in_flight }
 }
@@ -351,6 +354,16 @@ mod tests {
     fn middle_command_hung_with_the_next_started() {
         // 10 finished, 12 and 15 started: 12 is the first not finished.
         assert_eq!(progress(&[10, 12, 15], 15, 10), Progress::Stuck { first: 1, in_flight: 2 });
+    }
+
+    /// A `finished` past the list's last id came from another list sharing
+    /// the slot (or wrapped ids): none of this list's commands counts as
+    /// finished, and the first one is the one stuck. It indexed past the
+    /// entries and panicked in `report_list` (fuzeofficlal on #2310).
+    #[test]
+    fn a_finished_word_past_the_last_id_is_not_ours() {
+        assert_eq!(progress(&[10, 12, 15], 10, 20), Progress::Stuck { first: 0, in_flight: 1 });
+        assert_eq!(progress(&[1, 2], 1, 3), Progress::Stuck { first: 0, in_flight: 1 });
     }
 
     #[test]
