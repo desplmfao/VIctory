@@ -1135,6 +1135,9 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        if crate::blind::on() {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1250,6 +1253,9 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        if crate::blind::on() {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
@@ -1609,6 +1615,9 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        if crate::blind::on() {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         // Rectangles: completed by the pipeline's geometry shader, else
@@ -1713,6 +1722,9 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        if crate::blind::on() {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -1753,6 +1765,9 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        if crate::blind::on() {
+            return false;
+        }
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
