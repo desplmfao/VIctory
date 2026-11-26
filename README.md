@@ -34,7 +34,7 @@ indirect draw.
 | [#2153](https://github.com/Marvisak/VIctory/pull/2153) | SaymonMaster14 ([#472](https://github.com/Marvisak/VIctory/pull/472)), rebased by desplmfao | Caps the idle snapshot pool (2 GB less RAM in the world) and shares one texture staging buffer |
 | [#2099](https://github.com/Marvisak/VIctory/pull/2099) | 0xkn0wh3r3 | The descriptor view table stops growing (about 200 MB more RAM every 30 s in the world without it) |
 | [#2071](https://github.com/Marvisak/VIctory/pull/2071) | 0xkn0wh3r3 | Frees the executable's bytes once loaded (228 MB) |
-| [#2088](https://github.com/Marvisak/VIctory/pull/2088) | kxiserino ([#402](https://github.com/Marvisak/VIctory/pull/402)), desplmfao | Reuses loose windows that hold a range; 256 KiB windows instead of 4 MiB |
+| [#2088](https://github.com/Marvisak/VIctory/pull/2088) | kxiserino ([#402](https://github.com/Marvisak/VIctory/pull/402)), desplmfao | Reuses loose windows that already hold a range (#402). Its 256 KiB windows are opt-in (`VICTORY_LOOSE_WINDOW_KIB=256`): less host memory but much more copying per frame |
 | [#2389](https://github.com/Marvisak/VIctory/pull/2389) | desplmfao (fxceless's mechanism, 507KAZ's tip) | Opt-in `VICTORY_LEVELS_ON_DEMAND=1`: streamed textures take video memory only for the levels the title holds (about 5 GB less) |
 | [#2230](https://github.com/Marvisak/VIctory/pull/2230) | desplmfao | Taps between two frames are not lost (input at low frame rates). **On by default in this fork**; `VICTORY_INPUT_LATCH=0` turns it off |
 
