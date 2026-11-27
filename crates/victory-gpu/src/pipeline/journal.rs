@@ -1,8 +1,8 @@
 //! Pipelines whose creation ends the process (`VICTORY_PIPELINE_JOURNAL`).
 //!
-//! Some host drivers crash while compiling a translated shader (under Wine,
-//! a fault inside `vkCreate*Pipelines` ends the process with exit code 3,
-//! before any handler of ours runs). Such a crash cannot be caught, so it
+//! Some host drivers crash while compiling a translated shader, and the
+//! fault can end the process before any handler of ours runs. Such a crash
+//! cannot be caught, so it
 //! is remembered instead: each pipeline is noted in `pending/` while it is
 //! created and the note is removed when creation returns.
 //!
