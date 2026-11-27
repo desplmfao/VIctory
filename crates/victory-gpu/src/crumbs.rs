@@ -13,10 +13,9 @@
 //! [`STUCK_AFTER`] (or a removed device) logs, per list, the last started
 //! and finished ids and the first command started but not finished.
 //!
-//! vkd3d-proton records `WriteBufferImmediate` as `vkCmdWriteBufferMarkerAMD`
-//! (top of pipe for `MARKER_IN`, bottom of pipe for `MARKER_OUT`) where the
-//! driver has `VK_AMD_buffer_marker`, which NVIDIA's does; without it the
-//! modes may be ignored and the writes are only in order.
+//! `WriteBufferImmediate`'s modes (top of pipe for `MARKER_IN`, bottom of
+//! pipe for `MARKER_OUT`) are kept where the host supports them; elsewhere
+//! the writes are only in order.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -33,7 +32,7 @@ const SLOT_BYTES: u64 = 8;
 /// A submission running this long is reported (the host resets the device
 /// after about 2 s of one command on Windows; NVIDIA's Linux driver later).
 pub(crate) const STUCK_AFTER: Duration = Duration::from_secs(3);
-/// Wine aborts on log lines over about 1020 bytes.
+/// Log lines stay under about 1 KB: some hosts abort on longer ones.
 const LINE: usize = 880;
 
 /// Whether breadcrumbs are on (`VICTORY_GPU_BREADCRUMBS`).
