@@ -74,7 +74,9 @@ fn journal() -> Option<&'static Journal> {
     static JOURNAL: OnceLock<Option<Journal>> = OnceLock::new();
     JOURNAL
         .get_or_init(|| {
-            std::env::var_os("VICTORY_PIPELINE_JOURNAL").filter(|v| v == "1")?;
+            if !crate::switch::on("VICTORY_PIPELINE_JOURNAL") {
+                return None;
+            }
             let Some(dir) = DIR.get() else {
                 tracing::warn!("VICTORY_PIPELINE_JOURNAL: no cache folder; journal off");
                 return None;
