@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
-use crate::host::{Crumb, HostList, host};
+use crate::host::{HostList, host};
 use crate::object::This;
 use windows::core::Interface;
 
@@ -537,9 +537,7 @@ fn copies(
             },
         };
         // SAFETY: an open list; both locations name live resources.
-        list.crumbed(Crumb::Copy, Some("texture upload"), || unsafe {
-            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None)
-        });
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
 }
 
