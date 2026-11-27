@@ -2539,7 +2539,7 @@ pub(crate) mod tests {
         let freed = unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) } != 0;
         if !freed || allocation_extent(base).is_some() {
             // Windows keeps memory a heap was opened over until the heap
-            // goes (Wine releases it at once): let go of it, then release.
+            // goes (other hosts may release it at once): let go of it, then release.
             let_go_in_place(base as u64, 1 << 20);
             // SAFETY: our allocation.
             assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0, "released once the heap is let go");
@@ -2829,7 +2829,7 @@ pub(crate) mod tests {
         };
         let Some(host) = host() else { return };
         if host.device.cast::<ID3D12Device13>().is_err() {
-            return; // no sub-range heaps on this host (vkd3d-proton)
+            return; // no sub-range heaps on this host
         }
         const LEN: usize = 16 << 20;
         // SAFETY: our own allocation.
