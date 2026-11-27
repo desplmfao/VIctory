@@ -421,7 +421,9 @@ impl Latch {
                         _ => 0,
                     };
                     let pressed = pad.buttons & !before;
-                    if pressed != 0 && self.buttons.len() < LATCH_QUEUE {
+                    // The same buttons tapped again before a read are one
+                    // press: queued twice, they stayed down for two reads.
+                    if pressed != 0 && self.buttons.back() != Some(&pressed) && self.buttons.len() < LATCH_QUEUE {
                         self.buttons.push_back(pressed);
                     }
                 }
@@ -432,7 +434,10 @@ impl Latch {
                     };
                     let pressed: Vec<KeyState> =
                         keys.iter().filter(|k| !before.iter().any(|b| same_key(b, k))).copied().collect();
-                    if !pressed.is_empty() && self.keys.len() < LATCH_QUEUE {
+                    let again = self.keys.back().is_some_and(|last| {
+                        last.len() == pressed.len() && last.iter().all(|l| pressed.iter().any(|p| same_key(l, p)))
+                    });
+                    if !pressed.is_empty() && !again && self.keys.len() < LATCH_QUEUE {
                         self.keys.push_back(pressed);
                     }
                 }
@@ -2167,6 +2172,39 @@ mod tests {
         hub.poll();
         assert_eq!(buttons(hub, 0).0, A | B);
         assert_eq!(buttons(hub, 0).0, 0);
+    }
+
+    /// The same button or key tapped several times between two reads is one
+    /// press, released at the next read: queued once per tap, it stayed down
+    /// for as many reads (fuzeofficlal on #2230).
+    #[test]
+    fn the_same_tap_repeated_between_reads_is_one_press() {
+        let (hub, host) = fake();
+        // A pad that has reported input (an all-zero one stays hidden until
+        // it does), with no button down.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            left_y: 0.25,
+            ..Default::default()
+        });
+        hub.poll();
+        assert_eq!(buttons(hub, 0).0, 0);
+        for b in [A, 0, A, 0, A, 0, A, 0] {
+            host.lock().unwrap().pads[0] = Some(PadState {
+                buttons: b,
+                ..Default::default()
+            });
+            hub.poll();
+        }
+        assert_eq!(buttons(hub, 0).0, A, "one press");
+        assert_eq!(buttons(hub, 0).0, 0, "released at the next read");
+        // Keys too.
+        assert_eq!(held_keys(hub), Vec::<u8>::new());
+        for k in [vec![key(b'Q')], vec![], vec![key(b'Q')], vec![]] {
+            host.lock().unwrap().keys = k;
+            hub.poll();
+        }
+        assert_eq!(held_keys(hub), vec![b'Q']);
+        assert_eq!(held_keys(hub), Vec::<u8>::new());
     }
 
     #[test]
