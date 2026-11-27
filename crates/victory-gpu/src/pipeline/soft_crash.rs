@@ -1,7 +1,7 @@
 //! Pipelines whose creation faults, survived (`VICTORY_PIPELINE_SOFT_CRASH`).
 //!
 //! Creating a host pipeline runs the host's shader compilers on the calling
-//! thread: under vkd3d-proton, dxil-spirv and then the driver's compiler.
+//! thread (a translation layer's, if any, then the driver's).
 //! Some translated shaders make one of them fault (an access violation, an
 //! illegal instruction, a stack overflow). With this switch on, such a fault
 //! on a pipeline worker ends that creation instead of the process: the
